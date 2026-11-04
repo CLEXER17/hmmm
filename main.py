@@ -15,10 +15,13 @@ from telethon.errors import (
 # ---------- CONFIG ----------
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
-BOT_TOKEN = os.environ["BOT_TOKEN"]            # monitor bot token (from @BotFather)
-ADMIN_ID = int(os.environ["ADMIN_ID"])         # your Telegram numeric user id
-TARGET_BOT = os.environ["TARGET_BOT"]          # e.g. @TargetBot
-SESSIONS = [s.strip() for s in os.environ["SESSIONS"].replace("\n", ",").split(",") if s.strip()]
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+ADMIN_ID = int(os.environ["ADMIN_ID"])
+TARGET_BOT = os.environ["TARGET_BOT"]
+
+SESSIONS = [s.strip() for s in os.environ.get("SESSIONS", "").replace("\n", ",").split(",") if s.strip()]
+SESSIONS += [v.strip() for k, v in sorted(os.environ.items(), key=lambda x: (len(x[0]), x[0]))
+             if k.startswith("SESSION_") and v.strip()]
 
 DAILY_MIN = int(os.getenv("DAILY_MIN", "50"))
 DAILY_MAX = int(os.getenv("DAILY_MAX", "100"))
@@ -34,6 +37,9 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 QUESTION_TOPIC = os.getenv("QUESTION_TOPIC", "everyday general topics")
 
 IST = timezone(timedelta(hours=5, minutes=30))
+
+# Fixed target set by /set (None = random between DAILY_MIN and DAILY_MAX)
+FIXED_TARGET: Optional[int] = int(os.getenv("FIXED_TARGET", "0")) or None
 
 # ---------- LOGGING (ERROR -> admin DM) ----------
 alert_q: asyncio.Queue = asyncio.Queue()
@@ -129,6 +135,10 @@ progress_task: Optional[asyncio.Task] = None
 
 FATAL = (UserDeactivatedError, UserDeactivatedBanError, AuthKeyUnregisteredError,
          AuthKeyDuplicatedError, SessionRevokedError)
+
+
+def pick_target() -> int:
+    return FIXED_TARGET if FIXED_TARGET else random.randint(DAILY_MIN, DAILY_MAX)
 
 
 async def connect(acc: Acc):
@@ -227,7 +237,8 @@ def render():
     active = [a for a in accs if a.ready]
     tot = sum(a.target for a in active)
     done = sum(a.done for a in active)
-    lines = [f"📊 Progress\n{bar(done, tot)}  {done}/{tot}\n"]
+    mode = f"fixed {FIXED_TARGET}" if FIXED_TARGET else f"random {DAILY_MIN}-{DAILY_MAX}"
+    lines = [f"📊 Progress ({mode})\n{bar(done, tot)}  {done}/{tot}\n"]
     for a in accs:
         extra = ""
         if a.status == "cooldown":
@@ -267,7 +278,37 @@ def is_running():
 # ---------- ADMIN COMMANDS ----------
 @bot.on(events.NewMessage(from_users=ADMIN_ID, pattern=r"(?i)^/(start|help)(@\w+)?$"))
 async def h_help(ev):
-    await ev.respond("Commands:\n/run - start all accounts\n/stop - stop all\n/status - progress now")
+    await ev.respond(
+        "Commands:\n"
+        "/set 50 - every account needs 50 bot replies\n"
+        "/set off - back to random target\n"
+        "/set - show current target\n"
+        "/run - start all accounts\n"
+        "/stop - stop all\n"
+        "/status - progress now"
+    )
+
+
+@bot.on(events.NewMessage(from_users=ADMIN_ID, pattern=r"(?i)^/set(@\w+)?(?:\s+(\S+))?$"))
+async def h_set(ev):
+    global FIXED_TARGET
+    arg = ev.pattern_match.group(2)
+    if not arg:
+        cur = f"{FIXED_TARGET} per account" if FIXED_TARGET else f"random {DAILY_MIN}-{DAILY_MAX}"
+        return await ev.respond(f"🎯 Current target: {cur}\nUsage: /set 50  or  /set off")
+    if arg.lower() in ("off", "random"):
+        FIXED_TARGET = None
+        return await ev.respond(f"🎲 Target is random ({DAILY_MIN}-{DAILY_MAX}) from the next /run.")
+    if arg.isdigit() and int(arg) > 0:
+        FIXED_TARGET = int(arg)
+        live = 0
+        for a in accs:
+            if a.task and not a.task.done():
+                a.target = FIXED_TARGET
+                live += 1
+        note = f" Updated {live} running account(s)." if live else " Applies from the next /run."
+        return await ev.respond(f"🎯 Target set: {FIXED_TARGET} replies per account.{note}")
+    await ev.respond("Usage: /set 50  or  /set off")
 
 
 @bot.on(events.NewMessage(from_users=ADMIN_ID, pattern=r"(?i)^/run(@\w+)?$"))
@@ -279,7 +320,7 @@ async def h_run(ev):
     if not ready:
         return await ev.respond("No working accounts. Check the error alerts.")
     for a in ready:
-        a.target = random.randint(DAILY_MIN, DAILY_MAX)
+        a.target = pick_target()
         a.done = a.fails = a.cycles = 0
         a.status = "idle"
         a.task = asyncio.create_task(run_account(a))
@@ -317,7 +358,7 @@ async def main():
     for a in accs:
         await connect(a)
     ok = sum(1 for a in accs if a.ready)
-    await bot.send_message(ADMIN_ID, f"✅ Online. {ok}/{len(accs)} accounts ready.\nSend /run to start.")
+    await bot.send_message(ADMIN_ID, f"✅ Online. {ok}/{len(accs)} accounts ready.\nSend /set 50 then /run.")
     await bot.run_until_disconnected()
 
 

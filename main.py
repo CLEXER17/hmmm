@@ -35,6 +35,7 @@ QUESTION_TOPIC = os.getenv("QUESTION_TOPIC", "everyday general topics")
 IST = timezone(timedelta(hours=5, minutes=30))
 FIXED_TARGET: Optional[int] = int(os.getenv("FIXED_TARGET", "0")) or None
 
+
 # ---------- SESSION LOADING ----------
 def clean_session(s):
     return re.sub(r"[^A-Za-z0-9_\-=]", "", s)
@@ -160,9 +161,13 @@ class Acc:
     idx: int
     label: str
     session: str
+    group: str = ""
     client: Optional[TelegramClient] = None
+    user_id: int = 0
     username: str = ""
     last_user: str = ""
+    dup_of: str = ""
+    role: str = "new"      # primary spare broken dead
     ready: bool = False
     error: str = ""
     target: int = 0
@@ -181,8 +186,9 @@ class Acc:
 accs = []
 for i, (lab, raw) in enumerate(ENTRIES):
     label, sess = parse_entry(lab, raw)
-    accs.append(Acc(i, label, sess, last_user=NAMES.get(label, "")))
+    accs.append(Acc(i, label, sess, group=label.split("__")[0], last_user=NAMES.get(label, "")))
 
+GROUPS: dict = {}   # telegram user_id -> [valid Acc sorted by idx]
 bot = TelegramClient(StringSession(), API_ID, API_HASH)
 progress_task: Optional[asyncio.Task] = None
 
@@ -192,6 +198,10 @@ FATAL = (UserDeactivatedError, UserDeactivatedBanError, AuthKeyUnregisteredError
 
 def pick_target() -> int:
     return FIXED_TARGET if FIXED_TARGET else random.randint(DAILY_MIN, DAILY_MAX)
+
+
+def primaries():
+    return [a for a in accs if a.role == "primary"]
 
 
 def validate(s):
@@ -207,22 +217,24 @@ def validate(s):
 async def connect(acc: Acc, seen: dict):
     err = validate(acc.session)
     if not err and acc.session in seen:
-        err = f"same session string as {seen[acc.session]}"
+        acc.dup_of = seen[acc.session]
+        err = f"exact duplicate of {acc.dup_of}"
     if err:
-        acc.status = "error"
         acc.error = err
-        log.error(f"BROKEN SESSION -> {acc.tag()}: {err}")
+        acc.status = "error"
+        log.warning(f"[{acc.label}] {err}")
         return
     seen[acc.session] = acc.label
     try:
         acc.client = TelegramClient(StringSession(acc.session), API_ID, API_HASH)
         await acc.client.connect()
         if not await acc.client.is_user_authorized():
-            acc.status = "error"
             acc.error = "session dead/revoked (not authorized)"
-            log.error(f"BROKEN SESSION -> {acc.tag()}: {acc.error}")
+            acc.status = "error"
+            log.warning(f"[{acc.label}] {acc.error}")
             return
         me = await acc.client.get_me()
+        acc.user_id = me.id
         acc.username = me.username or str(me.id)
         NAMES[acc.label] = acc.username
         save_names(NAMES)
@@ -230,14 +242,116 @@ async def connect(acc: Acc, seen: dict):
         acc.error = ""
         log.info(f"[{acc.tag()}] connected")
     except Exception as e:
-        acc.status = "error"
         acc.error = repr(e)[:150]
-        log.error(f"CONNECT FAILED -> {acc.tag()}: {acc.error}")
+        acc.status = "error"
+        log.warning(f"[{acc.label}] connect failed: {acc.error}")
 
 
+# ---------- GROUPING (one account = one active string) ----------
+async def organize():
+    GROUPS.clear()
+    for a in accs:
+        if a.ready:
+            GROUPS.setdefault(a.user_id, []).append(a)
+        else:
+            a.role = "broken"
+    for uid, lst in GROUPS.items():
+        lst.sort(key=lambda a: a.idx)
+        lst[0].role = "primary"
+        for sp in lst[1:]:
+            sp.role = "spare"
+            try:
+                await sp.client.disconnect()
+            except Exception:
+                pass
+
+
+def owner_of(a: Acc):
+    """Find which working account a broken string belongs to (by exact duplicate, name group, or last known @user)."""
+    if a.dup_of:
+        o = next((x for x in accs if x.label == a.dup_of and x.user_id), None)
+        if o:
+            return o.user_id
+    for x in accs:
+        if x.user_id and x is not a and x.group == a.group:
+            return x.user_id
+    if a.last_user:
+        for x in accs:
+            if x.user_id and x.username == a.last_user:
+                return x.user_id
+    return None
+
+
+def describe_broken(a: Acc):
+    uid = owner_of(a)
+    if uid:
+        good = GROUPS.get(uid, [])
+        bad = [x for x in accs if not x.ready and x is not a and owner_of(x) == uid] + [a]
+        user = good[0].username if good else (a.last_user or "?")
+        return (f"❌ {a.label} — account @{user} has {len(good) + len(bad)} string(s): "
+                f"{len(good)} valid, {len(bad)} corrupt. This one: {a.error}")
+    who = f" (last known @{a.last_user})" if a.last_user else ""
+    return f"❌ {a.label}{who} — owner unknown. {a.error}"
+
+
+def accounts_report():
+    lines = [f"👥 {len(accs)} strings → {len(GROUPS)} unique working account(s)"]
+    bad_by_owner, unknown = {}, []
+    for a in accs:
+        if a.ready:
+            continue
+        uid = owner_of(a)
+        if uid:
+            bad_by_owner.setdefault(uid, []).append(a)
+        else:
+            unknown.append(a)
+    for uid, lst in GROUPS.items():
+        bad = bad_by_owner.get(uid, [])
+        total = len(lst) + len(bad)
+        if total == 1:
+            lines.append(f"\n👤 @{lst[0].username} — 1 string ✅")
+            continue
+        head = f"\n👤 @{lst[0].username} — {total} strings: {len(lst)} valid"
+        head += f", {len(bad)} CORRUPT" if bad else ""
+        lines.append(head)
+        for a in lst:
+            lines.append(f"   {'✅ in use' if a.role == 'primary' else '⚪ spare'}: {a.label}")
+        for a in bad:
+            lines.append(f"   ❌ CORRUPT: {a.label} — {a.error}")
+    if unknown:
+        lines.append("\n❌ Broken strings, owner unknown (rename extra strings NAME__2 to match):")
+        for a in unknown:
+            who = f" (last known @{a.last_user})" if a.last_user else ""
+            lines.append(f"   • {a.label}{who} — {a.error}")
+    return "\n".join(lines)
+
+
+async def promote(dead: Acc):
+    """Switch to a spare string of the same account."""
+    for sp in GROUPS.get(dead.user_id, []):
+        if sp is dead or sp.role != "spare":
+            continue
+        try:
+            sp.client = TelegramClient(StringSession(sp.session), API_ID, API_HASH)
+            await sp.client.connect()
+            if not await sp.client.is_user_authorized():
+                raise RuntimeError("spare string not authorized")
+            sp.role = "primary"
+            sp.status = "idle"
+            return sp
+        except Exception as e:
+            sp.role = "broken"
+            sp.ready = False
+            sp.error = f"spare failed: {e!r}"[:150]
+            log.error(f"SPARE BROKEN -> {sp.tag()}: {sp.error}")
+    return None
+
+
+# ---------- WORKER ----------
 async def run_account(acc: Acc):
     try:
-        await asyncio.sleep(acc.idx * random.uniform(5, 20))
+        if acc.done == 0:
+            await asyncio.sleep(acc.idx * random.uniform(5, 20))
         acc.status = "running"
         errors = 0
         while acc.done < acc.target:
@@ -279,8 +393,16 @@ async def run_account(acc: Acc):
             except FATAL as e:
                 acc.status = "error"
                 acc.ready = False
+                acc.role = "dead"
                 acc.error = f"{type(e).__name__} (session dead/banned)"
-                log.error(f"BROKEN SESSION -> {acc.tag()}: {acc.error}. Stopped.")
+                log.error(f"BROKEN SESSION -> {acc.tag()}: {acc.error}")
+                sp = await promote(acc)
+                if sp:
+                    sp.target, sp.done = acc.target, acc.done
+                    sp.task = asyncio.create_task(run_account(sp))
+                    log.error(f"[{acc.label}] switched to spare string {sp.label} for @{sp.username}, continuing at {sp.done}/{sp.target}")
+                else:
+                    log.error(f"[{acc.label}] no spare string left for @{acc.username}. Stopped.")
                 return
             except asyncio.CancelledError:
                 raise
@@ -305,15 +427,18 @@ async def run_account(acc: Acc):
 
 
 # ---------- KEYBOARDS ----------
-B_RUN, B_STOP, B_STATUS, B_PING, B_SET, B_HIDE = "▶️ Run", "🛑 Stop", "📊 Status", "🏓 Ping", "🎯 Set target", "⌨️ Hide"
-TEXT_MAP = {B_RUN: "run", B_STOP: "stop", B_STATUS: "status", B_PING: "ping", B_SET: "set", B_HIDE: "hide"}
+B_RUN, B_STOP, B_STATUS, B_PING = "▶️ Run", "🛑 Stop", "📊 Status", "🏓 Ping"
+B_ACC, B_SET, B_HIDE = "👥 Accounts", "🎯 Set target", "⌨️ Hide"
+TEXT_MAP = {B_RUN: "run", B_STOP: "stop", B_STATUS: "status", B_PING: "ping",
+            B_ACC: "accounts", B_SET: "set", B_HIDE: "hide"}
 
 
 def reply_kb():
     return [
         [Button.text(B_RUN, resize=True), Button.text(B_STOP, resize=True)],
         [Button.text(B_STATUS, resize=True), Button.text(B_PING, resize=True)],
-        [Button.text(B_SET, resize=True), Button.text(B_HIDE, resize=True)],
+        [Button.text(B_ACC, resize=True), Button.text(B_SET, resize=True)],
+        [Button.text(B_HIDE, resize=True)],
     ]
 
 
@@ -321,7 +446,7 @@ def inline_main():
     return [
         [Button.inline("▶️ Run", b"run"), Button.inline("🛑 Stop", b"stop")],
         [Button.inline("📊 Status", b"status"), Button.inline("🏓 Ping", b"ping")],
-        [Button.inline("🎯 Set target", b"settarget")],
+        [Button.inline("👥 Accounts", b"accounts"), Button.inline("🎯 Set target", b"settarget")],
         [Button.inline("⌨️ Hide keyboard", b"kbhide"), Button.inline("⌨️ Show keyboard", b"kbshow")],
     ]
 
@@ -349,14 +474,16 @@ def bar(done, total, w=20):
 
 
 def render():
-    active = [a for a in accs if a.ready]
+    active = primaries()
     tot = sum(a.target for a in active)
     done = sum(a.done for a in active)
     mode = f"fixed {FIXED_TARGET}" if FIXED_TARGET else f"random {DAILY_MIN}-{DAILY_MAX}"
     lines = [f"📊 Progress ({mode})\n{bar(done, tot)}  {done}/{tot}\n"]
     for a in accs:
-        if not a.ready:
-            lines.append(f"❌ {a.tag()} — {a.error or 'not connected'}")
+        if a.role in ("spare", "dead"):
+            continue
+        if a.role != "primary":
+            lines.append(f"❌ {a.label} — {a.error or 'not connected'}")
             continue
         extra = ""
         if a.status == "cooldown":
@@ -366,6 +493,9 @@ def render():
         elif a.fails:
             extra = f" ⚠️ fail {a.fails}/{MAX_RETRIES}"
         lines.append(f"{ICON.get(a.status, '⚪')} {a.tag()} {bar(a.done, a.target, 10)} {a.done}/{a.target}{extra}")
+    spare = sum(1 for a in accs if a.role == "spare")
+    if spare:
+        lines.append(f"\n⚪ {spare} spare string(s) on standby")
     lines.append(f"\n🕒 {datetime.now(IST).strftime('%H:%M:%S')} IST")
     return "\n".join(lines)
 
@@ -375,7 +505,7 @@ def is_running():
 
 
 async def say(text, buttons=None):
-    return await bot.send_message(ADMIN_ID, text, buttons=buttons)
+    return await bot.send_message(ADMIN_ID, text[:4000], buttons=buttons)
 
 
 async def progress_loop(msg):
@@ -401,8 +531,6 @@ async def progress_loop(msg):
 
 # ---------- PING ----------
 async def ping_one(a: Acc):
-    if not a.ready:
-        return False, f"❌ {a.tag()} — BROKEN: {a.error or 'not connected'}"
     try:
         if not a.client.is_connected():
             await a.client.connect()
@@ -412,18 +540,30 @@ async def ping_one(a: Acc):
         return True, f"✅ {a.tag()} — {ms}ms · {a.status} {a.done}/{a.target}"
     except FATAL as e:
         a.ready = False
+        a.role = "dead"
         a.error = f"{type(e).__name__} (session dead/banned)"
-        return False, f"❌ {a.tag()} — {a.error}"
+        log.error(f"BROKEN SESSION -> {a.tag()}: {a.error}")
+        sp = await promote(a)
+        if sp:
+            return True, f"🔁 {a.tag()} died, switched to spare {sp.label}"
+        return False, f"❌ {a.tag()} — {a.error}, no spare left"
     except Exception as e:
         return False, f"❌ {a.tag()} — no response ({type(e).__name__})"
 
 
 async def act_ping():
-    if not accs:
-        return await say("No accounts configured.", inline_main())
-    results = await asyncio.gather(*(ping_one(a) for a in accs))
+    prim = primaries()
+    if not prim:
+        return await say("No working accounts.\n\n" + accounts_report(), inline_main())
+    results = await asyncio.gather(*(ping_one(a) for a in prim))
     alive = sum(1 for ok, _ in results if ok)
-    lines = [f"🏓 Ping: {alive}/{len(accs)} alive\n"] + [t for _, t in results]
+    spare = sum(1 for a in accs if a.role == "spare")
+    lines = [f"🏓 Ping: {alive}/{len(prim)} accounts alive ({len(accs)} strings, {spare} spare)\n"]
+    lines += [t for _, t in results]
+    bad = [a for a in accs if a.role == "broken"]
+    if bad:
+        lines.append("\n⚠️ Corrupt/broken strings:")
+        lines += [describe_broken(a) for a in bad]
     lines.append(f"\n🕒 {datetime.now(IST).strftime('%H:%M:%S')} IST")
     await say("\n".join(lines), inline_main())
 
@@ -433,9 +573,9 @@ async def act_run():
     global progress_task
     if is_running():
         return await say("Already running.", inline_run())
-    ready = [a for a in accs if a.ready]
+    ready = [a for a in primaries() if a.ready]
     if not ready:
-        return await say("No working accounts. Tap Ping to see which are broken.", inline_main())
+        return await say("No working accounts. Tap Accounts to see what is broken.", inline_main())
     for a in ready:
         a.target = pick_target()
         a.done = a.fails = a.cycles = 0
@@ -479,8 +619,8 @@ async def act_set(arg=None):
     await say("Usage: /set 50  or  /set off", inline_targets())
 
 
-HELP = ("Commands:\n/run /stop /status /ping\n/set 50 - replies per account\n/set off - random target\n"
-        "/menu - show keyboard\n/hide - hide keyboard")
+HELP = ("Commands:\n/run /stop /status /ping\n/accounts - strings per account, corrupt ones\n"
+        "/set 50 - replies per account\n/set off - random target\n/menu - show keyboard\n/hide - hide keyboard")
 
 
 async def dispatch(cmd, arg=None):
@@ -497,6 +637,8 @@ async def dispatch(cmd, arg=None):
         return await act_status()
     if cmd == "ping":
         return await act_ping()
+    if cmd == "accounts":
+        return await say(accounts_report(), inline_main())
     if cmd == "set":
         return await act_set(arg)
 
@@ -548,12 +690,12 @@ async def main():
     seen = {}
     for a in accs:
         await connect(a, seen)
-    ok = sum(1 for a in accs if a.ready)
-    broken = [a for a in accs if not a.ready]
-    text = f"✅ Online. {ok}/{len(accs)} accounts ready."
-    if broken:
-        text += "\n\n❌ Broken sessions:\n" + "\n".join(f"• {a.tag()} — {a.error}" for a in broken)
-    text += "\n\nTap Run, or send /set 50 then /run."
+    await organize()
+    for a in accs:
+        if a.role == "broken":
+            log.error(describe_broken(a))
+    text = (f"✅ Online. {len(GROUPS)} unique account(s) ready from {len(accs)} string(s).\n\n"
+            f"{accounts_report()}\n\nTap Run, or send /set 50 then /run.")
     await say(text, reply_kb())
     await say("Controls:", inline_main())
     await bot.run_until_disconnected()

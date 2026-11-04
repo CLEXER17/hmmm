@@ -106,6 +106,106 @@ _ah = AdminAlertHandler(level=logging.ERROR)
 _ah.setFormatter(_fmt)
 log.addHandler(_ah)
 
+# ---------- STATE (daily counts, earnings) ----------
+REPLY_RATE = float(os.getenv("REPLY_RATE", "0.003"))
+DATA_DIR = os.getenv("DATA_DIR", ".")
+STATE_FILE = os.path.join(DATA_DIR, "state.json")
+BRAND = "▰▰ 𝗖𝗟𝗘𝗫𝗘𝗥 ▰▰"
+AWAIT_BALANCE = False
+
+
+def today_str():
+    return datetime.now(IST).strftime("%Y-%m-%d")
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+STATE = load_state()
+STATE.setdefault("date", today_str())
+STATE.setdefault("daily", {})     # user_id -> replies today
+STATE.setdefault("targets", {})   # user_id -> random target chosen today
+STATE.setdefault("history", {})   # date -> replies
+STATE.setdefault("base", 0.0)     # balance you inserted
+STATE.setdefault("since", 0)      # replies counted since that balance was set
+
+
+def save_state():
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(STATE, f)
+    except Exception as e:
+        log.warning(f"state save failed: {e}")
+
+
+def ensure_today():
+    """Rolls the day at 00:00 IST. Returns True if a new day started."""
+    t = today_str()
+    if STATE["date"] != t:
+        STATE["history"][STATE["date"]] = sum(STATE["daily"].values())
+        STATE["history"] = dict(sorted(STATE["history"].items())[-30:])
+        STATE["daily"], STATE["targets"], STATE["date"] = {}, {}, t
+        save_state()
+        return True
+    return False
+
+
+def bump(uid):
+    ensure_today()
+    k = str(uid)
+    STATE["daily"][k] = STATE["daily"].get(k, 0) + 1
+    STATE["since"] += 1
+    save_state()
+
+
+def day_done(uid):
+    ensure_today()
+    return STATE["daily"].get(str(uid), 0)
+
+
+def daily_target(uid):
+    ensure_today()
+    if FIXED_TARGET:
+        return FIXED_TARGET
+    k = str(uid)
+    if k not in STATE["targets"]:
+        STATE["targets"][k] = random.randint(DAILY_MIN, DAILY_MAX)
+        save_state()
+    return STATE["targets"][k]
+
+
+def money(x):
+    return f"${x:,.3f}"
+
+
+def dashboard():
+    ensure_today()
+    today = sum(STATE["daily"].values())
+    life = STATE["base"] + STATE["since"] * REPLY_RATE
+    lines = [
+        "💰 Earnings Dashboard",
+        f"Rate: {money(REPLY_RATE)} per reply\n",
+        f"📅 Today ({STATE['date']}): {today} replies → {money(today * REPLY_RATE)}",
+        f"🏦 Lifetime balance: {money(life)}",
+        f"   (inserted {money(STATE['base'])} + {STATE['since']} replies × {money(REPLY_RATE)})",
+    ]
+    hist = list(STATE["history"].items())[-7:]
+    if hist:
+        lines.append("\n🗓 Previous days:")
+        lines += [f"   {d}: {n} replies → {money(n * REPLY_RATE)}" for d, n in hist]
+    lines.append("\n👤 Today per account:")
+    for a in primaries():
+        n = day_done(a.user_id)
+        lines.append(f"   @{a.username}: {n}/{daily_target(a.user_id)} → {money(n * REPLY_RATE)}")
+    return "\n".join(lines)
+
+
 # ---------- QUESTIONS ----------
 FALLBACK = [
     "hi", "hello", "how are you?", "what can you do?", "help me", "show menu",
@@ -170,8 +270,8 @@ class Acc:
     role: str = "new"      # primary spare broken dead
     ready: bool = False
     error: str = ""
-    target: int = 0
-    done: int = 0
+    target: int = 0        # replies to do in THIS run (remaining for today)
+    done: int = 0          # replies done in THIS run
     fails: int = 0
     cycles: int = 0
     status: str = "idle"   # idle running cooldown done stopped error
@@ -194,10 +294,6 @@ progress_task: Optional[asyncio.Task] = None
 
 FATAL = (UserDeactivatedError, UserDeactivatedBanError, AuthKeyUnregisteredError,
          AuthKeyDuplicatedError, SessionRevokedError)
-
-
-def pick_target() -> int:
-    return FIXED_TARGET if FIXED_TARGET else random.randint(DAILY_MIN, DAILY_MAX)
 
 
 def primaries():
@@ -267,7 +363,7 @@ async def organize():
 
 
 def owner_of(a: Acc):
-    """Find which working account a broken string belongs to (by exact duplicate, name group, or last known @user)."""
+    """Find which working account a broken string belongs to (exact duplicate, name group, or last known @user)."""
     if a.dup_of:
         o = next((x for x in accs if x.label == a.dup_of and x.user_id), None)
         if o:
@@ -361,6 +457,7 @@ async def run_account(acc: Acc):
                     await conv.send_message(q)
                     reply = await conv.get_response()
                 acc.done += 1
+                bump(acc.user_id)
                 acc.fails = 0
                 acc.cycles = 0
                 errors = 0
@@ -429,14 +526,16 @@ async def run_account(acc: Acc):
 # ---------- KEYBOARDS ----------
 B_RUN, B_STOP, B_STATUS, B_PING = "▶️ Run", "🛑 Stop", "📊 Status", "🏓 Ping"
 B_ACC, B_SET, B_HIDE = "👥 Accounts", "🎯 Set target", "⌨️ Hide"
+B_DASH, B_BAL = "💰 Dashboard", "➕ Insert balance"
 TEXT_MAP = {B_RUN: "run", B_STOP: "stop", B_STATUS: "status", B_PING: "ping",
-            B_ACC: "accounts", B_SET: "set", B_HIDE: "hide"}
+            B_ACC: "accounts", B_SET: "set", B_HIDE: "hide", B_DASH: "dashboard", B_BAL: "balance"}
 
 
 def reply_kb():
     return [
         [Button.text(B_RUN, resize=True), Button.text(B_STOP, resize=True)],
         [Button.text(B_STATUS, resize=True), Button.text(B_PING, resize=True)],
+        [Button.text(B_DASH, resize=True), Button.text(B_BAL, resize=True)],
         [Button.text(B_ACC, resize=True), Button.text(B_SET, resize=True)],
         [Button.text(B_HIDE, resize=True)],
     ]
@@ -446,6 +545,7 @@ def inline_main():
     return [
         [Button.inline("▶️ Run", b"run"), Button.inline("🛑 Stop", b"stop")],
         [Button.inline("📊 Status", b"status"), Button.inline("🏓 Ping", b"ping")],
+        [Button.inline("💰 Dashboard", b"dashboard"), Button.inline("➕ Insert balance", b"balance")],
         [Button.inline("👥 Accounts", b"accounts"), Button.inline("🎯 Set target", b"settarget")],
         [Button.inline("⌨️ Hide keyboard", b"kbhide"), Button.inline("⌨️ Show keyboard", b"kbshow")],
     ]
@@ -492,7 +592,8 @@ def render():
             extra = f" ⚠️ {a.error}"
         elif a.fails:
             extra = f" ⚠️ fail {a.fails}/{MAX_RETRIES}"
-        lines.append(f"{ICON.get(a.status, '⚪')} {a.tag()} {bar(a.done, a.target, 10)} {a.done}/{a.target}{extra}")
+        dn, dt = day_done(a.user_id), daily_target(a.user_id)
+        lines.append(f"{ICON.get(a.status, '⚪')} {a.tag()} {bar(a.done, a.target, 10)} {a.done}/{a.target} · day {dn}/{dt}{extra}")
     spare = sum(1 for a in accs if a.role == "spare")
     if spare:
         lines.append(f"\n⚪ {spare} spare string(s) on standby")
@@ -505,7 +606,7 @@ def is_running():
 
 
 async def say(text, buttons=None):
-    return await bot.send_message(ADMIN_ID, text[:4000], buttons=buttons)
+    return await bot.send_message(ADMIN_ID, f"{BRAND}\n{text}"[:4000], buttons=buttons)
 
 
 async def progress_loop(msg):
@@ -515,7 +616,7 @@ async def progress_loop(msg):
         text = render()
         if text != last:
             try:
-                await msg.edit(text, buttons=inline_run() if running else inline_main())
+                await msg.edit(f"{BRAND}\n{text}", buttons=inline_run() if running else inline_main())
                 last = text
             except MessageNotModifiedError:
                 pass
@@ -573,16 +674,26 @@ async def act_run():
     global progress_task
     if is_running():
         return await say("Already running.", inline_run())
-    ready = [a for a in primaries() if a.ready]
-    if not ready:
-        return await say("No working accounts. Tap Accounts to see what is broken.", inline_main())
-    for a in ready:
-        a.target = pick_target()
-        a.done = a.fails = a.cycles = 0
+    ensure_today()
+    started, skipped = 0, []
+    for a in primaries():
+        if not a.ready:
+            continue
+        tgt, dn = daily_target(a.user_id), day_done(a.user_id)
+        remaining = tgt - dn
         a.error = ""
-        a.status = "idle"
+        a.fails = a.cycles = 0
+        if remaining <= 0:
+            a.target, a.done, a.status = 0, 0, "done"
+            skipped.append(f"{a.tag()} {dn}/{tgt}")
+            continue
+        a.target, a.done, a.status = remaining, 0, "idle"
         a.task = asyncio.create_task(run_account(a))
-    msg = await say(render(), inline_run())
+        started += 1
+    if not started:
+        return await say("✅ All accounts already completed today's limit.\n" + "\n".join(skipped), inline_main())
+    note = ("\n\n⏭ Already done today:\n" + "\n".join(skipped)) if skipped else ""
+    msg = await say(render() + note, inline_run())
     progress_task = asyncio.create_task(progress_loop(msg))
 
 
@@ -612,14 +723,30 @@ async def act_set(arg=None):
         live = 0
         for a in accs:
             if a.task and not a.task.done():
-                a.target = FIXED_TARGET
+                a.target = max(0, FIXED_TARGET - day_done(a.user_id) + a.done)
                 live += 1
         note = f" Updated {live} running account(s)." if live else " Applies from the next run."
         return await say(f"🎯 Target set: {FIXED_TARGET} replies per account.{note}", inline_main())
     await say("Usage: /set 50  or  /set off", inline_targets())
 
 
-HELP = ("Commands:\n/run /stop /status /ping\n/accounts - strings per account, corrupt ones\n"
+async def act_balance(arg=None):
+    global AWAIT_BALANCE
+    if arg is None:
+        AWAIT_BALANCE = True
+        return await say("➕ Send your current total balance in $ (example: 12.50)")
+    try:
+        val = float(arg.replace("$", "").replace(",", ""))
+    except ValueError:
+        return await say("Send a number, example: 12.50")
+    AWAIT_BALANCE = False
+    STATE["base"], STATE["since"] = val, 0
+    save_state()
+    await say(f"✅ Balance set to {money(val)}. Each new reply adds {money(REPLY_RATE)}.\n\n" + dashboard(), inline_main())
+
+
+HELP = ("Commands:\n/run /stop /status /ping\n/dashboard - earnings today and lifetime\n"
+        "/balance 12.50 - insert current balance\n/accounts - strings per account, corrupt ones\n"
         "/set 50 - replies per account\n/set off - random target\n/menu - show keyboard\n/hide - hide keyboard")
 
 
@@ -639,6 +766,10 @@ async def dispatch(cmd, arg=None):
         return await act_ping()
     if cmd == "accounts":
         return await say(accounts_report(), inline_main())
+    if cmd == "dashboard":
+        return await say(dashboard(), inline_main())
+    if cmd == "balance":
+        return await act_balance(arg)
     if cmd == "set":
         return await act_set(arg)
 
@@ -646,7 +777,11 @@ async def dispatch(cmd, arg=None):
 # ---------- HANDLERS ----------
 @bot.on(events.NewMessage(from_users=ADMIN_ID))
 async def h_msg(ev):
+    global AWAIT_BALANCE
     t = (ev.raw_text or "").strip()
+    if AWAIT_BALANCE and t and not t.startswith("/") and t not in TEXT_MAP:
+        return await act_balance(t)
+    AWAIT_BALANCE = False
     m = re.match(r"^/(\w+)(?:@\w+)?(?:\s+(\S+))?$", t)
     if m:
         cmd, arg = m.group(1).lower(), m.group(2)
@@ -684,9 +819,31 @@ async def alert_sender():
         await asyncio.sleep(1)
 
 
+async def midnight_loop():
+    while True:
+        n = datetime.now(IST)
+        nxt = (n + timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
+        await asyncio.sleep((nxt - n).total_seconds())
+        prev = STATE["date"]
+        if ensure_today():
+            y = STATE["history"].get(prev, 0)
+            await say(f"🌅 New day (IST). Yesterday: {y} replies → {money(y * REPLY_RATE)}\nDaily counters reset.", inline_main())
+
+
 async def main():
     await bot.start(bot_token=BOT_TOKEN)
     asyncio.create_task(alert_sender())
+    asyncio.create_task(midnight_loop())
+    try:
+        await bot.unpin_message(ADMIN_ID)
+        cap = f"{BRAND}\n𝗖𝗟𝗘𝗫𝗘𝗥 — auto worker"
+        if os.path.exists("logo.png"):
+            m = await bot.send_file(ADMIN_ID, "logo.png", caption=cap)
+        else:
+            m = await bot.send_message(ADMIN_ID, cap)
+        await bot.pin_message(ADMIN_ID, m, notify=False)
+    except Exception as e:
+        log.warning(f"pin failed: {e}")
     seen = {}
     for a in accs:
         await connect(a, seen)

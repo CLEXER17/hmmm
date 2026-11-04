@@ -25,7 +25,18 @@ if not API_ID or not API_HASH:
 
 label = input("Account name (e.g. CLEXEER): ").strip().upper().replace(" ", "_")
 label = re.sub(r"[^A-Z0-9_]", "", label) or "ACCOUNT"
-var = f"SESSION_{label}"
+base = f"SESSION_{label}"
+
+existing = []
+if os.path.exists("sessions.txt"):
+    for line in open("sessions.txt", encoding="utf-8"):
+        k = line.split("=", 1)[0].strip()
+        if k == base or k.startswith(base + "__"):
+            existing.append(k)
+
+var = base if not existing else f"{base}__{len(existing) + 1}"
+if existing:
+    print(f"{len(existing)} string(s) already saved for {label}. Saving this one as {var}.")
 
 with TelegramClient(StringSession(), int(API_ID), API_HASH) as client:
     s = client.session.save()

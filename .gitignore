@@ -1,4 +1,6 @@
 .env
+sessions.txt
+names.json
 *.session
 *.session-journal
 __pycache__/

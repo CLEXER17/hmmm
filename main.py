@@ -4,10 +4,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import aiohttp
-from telethon import TelegramClient, events, Button
+from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import (
-    FloodWaitError, MessageNotModifiedError, PeerFloodError,
+    FloodWaitError, PeerFloodError,
     UserDeactivatedError, UserDeactivatedBanError,
     AuthKeyUnregisteredError, AuthKeyDuplicatedError, SessionRevokedError,
 )
@@ -27,6 +27,9 @@ COOLDOWN_HOURS = float(os.getenv("COOLDOWN_HOURS", "4"))
 MIN_DELAY = int(os.getenv("MIN_DELAY", "20"))
 MAX_DELAY = int(os.getenv("MAX_DELAY", "90"))
 PROGRESS_EVERY = int(os.getenv("PROGRESS_EVERY", "5"))
+CONN_TRIES = int(os.getenv("CONN_TRIES", "4"))
+CONN_DELAYS = [10, 30, 60, 120]
+STAGGER = int(os.getenv("STAGGER", "0"))   # 0 = all accounts start at the same time
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
@@ -34,6 +37,12 @@ QUESTION_TOPIC = os.getenv("QUESTION_TOPIC", "everyday general topics")
 
 IST = timezone(timedelta(hours=5, minutes=30))
 FIXED_TARGET: Optional[int] = int(os.getenv("FIXED_TARGET", "0")) or None
+PREMIUM_ON = os.getenv("PREMIUM_EMOJI", "1") == "1"
+
+
+def new_client(session):
+    return TelegramClient(StringSession(session), API_ID, API_HASH,
+                          connection_retries=5, retry_delay=3, auto_reconnect=True)
 
 
 # ---------- SESSION LOADING ----------
@@ -84,13 +93,20 @@ def save_names(d):
 
 NAMES = load_names()
 
-# ---------- LOGGING (ERROR -> admin DM) ----------
+# ---------- LOGGING (ERROR -> admin DM, same error only once per hour) ----------
 alert_q: asyncio.Queue = asyncio.Queue()
+_recent: dict = {}
 
 
 class AdminAlertHandler(logging.Handler):
     def emit(self, record):
         try:
+            msg = record.getMessage()
+            key = re.sub(r"\(\d+/\d+\)|#\d+/\d+|\b\d+s\b", "", msg)
+            now_t = time.time()
+            if now_t - _recent.get(key, 0) < 3600:
+                return
+            _recent[key] = now_t
             alert_q.put_nowait(self.format(record))
         except Exception:
             pass
@@ -322,7 +338,7 @@ async def connect(acc: Acc, seen: dict):
         return
     seen[acc.session] = acc.label
     try:
-        acc.client = TelegramClient(StringSession(acc.session), API_ID, API_HASH)
+        acc.client = new_client(acc.session)
         await acc.client.connect()
         if not await acc.client.is_user_authorized():
             acc.error = "session dead/revoked (not authorized)"
@@ -428,7 +444,7 @@ async def promote(dead: Acc):
         if sp is dead or sp.role != "spare":
             continue
         try:
-            sp.client = TelegramClient(StringSession(sp.session), API_ID, API_HASH)
+            sp.client = new_client(sp.session)
             await sp.client.connect()
             if not await sp.client.is_user_authorized():
                 raise RuntimeError("spare string not authorized")
@@ -443,14 +459,129 @@ async def promote(dead: Acc):
     return None
 
 
+# ---------- BOT API SENDER (premium emojis + colored buttons) ----------
+BOT_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+_http: Optional[aiohttp.ClientSession] = None
+
+PREMIUM = {
+    "💰": "5359797475177691478", "🏦": "5332455502917949981", "🗓": "6025878226260202192",
+    "👤": "5258362837411045098", "📅": "5028418466000930064", "🚨": "6053367550257928793",
+    "🏁": "5408906741125490282", "🕒": "5215484787325676090", "⏳": "5370561264516865667",
+    "📊": "6053234303192537471", "➕": "6339079894458179573", "🎯": "5310278924616356636",
+    "🎲": "6172496405312051278", "⚪": "5820913139830492948", "🟢": "5039928501612839813",
+    "🟡": "4974280407529818183", "✅": "5940635490645449104", "🔴": "5042042652019655612",
+    "❌": "6052869226677410910",
+}
+
+
+async def api(method, **params):
+    global _http
+    if _http is None or _http.closed:
+        _http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+    for _ in range(3):
+        async with _http.post(f"{BOT_API}/{method}", json=params) as r:
+            data = await r.json()
+        if data.get("ok"):
+            return data["result"]
+        if data.get("error_code") == 429:
+            await asyncio.sleep(data.get("parameters", {}).get("retry_after", 5) + 1)
+            continue
+        raise RuntimeError(f"{method}: {data.get('description')}")
+    raise RuntimeError(f"{method}: rate limited")
+
+
+def with_premium(text):
+    """Entities that turn known emojis into premium custom emojis (offsets in UTF-16 units)."""
+    ents, off, i = [], 0, 0
+    while i < len(text):
+        ch = text[i]
+        n = 1
+        units = 2 if ord(ch) > 0xFFFF else 1
+        if ch in PREMIUM:
+            if i + 1 < len(text) and text[i + 1] == "\ufe0f":
+                n, units = 2, units + 1
+            ents.append({"type": "custom_emoji", "offset": off, "length": units,
+                         "custom_emoji_id": PREMIUM[ch]})
+        off += units
+        i += n
+    return ents
+
+
+def strip_icons(m):
+    if isinstance(m, dict):
+        return {k: strip_icons(v) for k, v in m.items() if k != "icon_custom_emoji_id"}
+    if isinstance(m, list):
+        return [strip_icons(x) for x in m]
+    return m
+
+
+def _prep(text, markup):
+    text = f"{BRAND}\n{text}"[:4000]
+    p = {"text": text}
+    if markup:
+        p["reply_markup"] = markup
+    if PREMIUM_ON:
+        ents = with_premium(text)
+        if ents:
+            p["entities"] = ents
+    return p
+
+
+async def _call(method, p):
+    global PREMIUM_ON
+    try:
+        return await api(method, **p)
+    except RuntimeError as e:
+        err = str(e)
+        if "not modified" in err.lower():
+            return None
+        if PREMIUM_ON and any(w in err.lower() for w in ("emoji", "entit", "icon", "premium")):
+            PREMIUM_ON = False
+            log.warning(f"Premium emoji not allowed for this bot, using normal emojis: {err}")
+            p = dict(p)
+            p.pop("entities", None)
+            if "reply_markup" in p:
+                p["reply_markup"] = strip_icons(p["reply_markup"])
+            return await api(method, **p)
+        raise
+
+
+async def say(text, buttons=None):
+    p = _prep(text, buttons)
+    p["chat_id"] = ADMIN_ID
+    r = await _call("sendMessage", p)
+    return r["message_id"] if r else None
+
+
+async def edit_msg(msg_id, text, buttons=None):
+    p = _prep(text, buttons)
+    p.update(chat_id=ADMIN_ID, message_id=msg_id)
+    await _call("editMessageText", p)
+
+
+async def safe_delete(msg_id):
+    try:
+        if msg_id:
+            await api("deleteMessage", chat_id=ADMIN_ID, message_id=msg_id)
+    except Exception:
+        pass
+
+
 # ---------- WORKER ----------
 async def run_account(acc: Acc):
+    conn_fails = 0
+    conn_msg = None
     try:
-        if acc.done == 0:
-            await asyncio.sleep(acc.idx * random.uniform(5, 20))
+        if acc.done == 0 and STAGGER > 0:
+            await asyncio.sleep(random.uniform(0, STAGGER))
         acc.status = "running"
         errors = 0
         while acc.done < acc.target:
+            if not acc.client.is_connected():
+                try:
+                    await acc.client.connect()
+                except Exception:
+                    pass
             q = await next_question()
             try:
                 async with acc.client.conversation(TARGET_BOT, timeout=REPLY_TIMEOUT) as conv:
@@ -461,6 +592,10 @@ async def run_account(acc: Acc):
                 acc.fails = 0
                 acc.cycles = 0
                 errors = 0
+                conn_fails = 0
+                if conn_msg:
+                    await safe_delete(conn_msg)
+                    conn_msg = None
                 log.info(f"[{acc.tag()}] #{acc.done}/{acc.target} q='{q[:40]}' reply='{(reply.text or '')[:40]}'")
             except asyncio.TimeoutError:
                 acc.fails += 1
@@ -501,6 +636,26 @@ async def run_account(acc: Acc):
                 else:
                     log.error(f"[{acc.label}] no spare string left for @{acc.username}. Stopped.")
                 return
+            except (ConnectionError, OSError) as e:
+                conn_fails += 1
+                log.warning(f"[{acc.tag()}] connection error {conn_fails}/{CONN_TRIES}: {e!r}")
+                if conn_fails == 1:
+                    conn_msg = await say(f"⚠️ {acc.tag()} lost connection. Retrying in the background…")
+                if conn_fails >= CONN_TRIES:
+                    await safe_delete(conn_msg)
+                    conn_msg = None
+                    acc.status = "error"
+                    acc.error = f"connection failed {CONN_TRIES} times ({type(e).__name__})"
+                    await say(
+                        f"❌ {acc.tag()} still not connecting after {CONN_TRIES} tries.\n"
+                        f"Reason: {type(e).__name__}: {str(e)[:120]}\n"
+                        f"This account is stopped. Other accounts keep running.\n"
+                        f"Tap Run to try it again.",
+                        inline_main(),
+                    )
+                    return
+                await asyncio.sleep(CONN_DELAYS[min(conn_fails - 1, len(CONN_DELAYS) - 1)])
+                continue
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -523,44 +678,73 @@ async def run_account(acc: Acc):
         raise
 
 
-# ---------- KEYBOARDS ----------
-B_RUN, B_STOP, B_STATUS, B_PING = "▶️ Run", "🛑 Stop", "📊 Status", "🏓 Ping"
-B_ACC, B_SET, B_HIDE = "👥 Accounts", "🎯 Set target", "⌨️ Hide"
-B_DASH, B_BAL = "💰 Dashboard", "➕ Insert balance"
-TEXT_MAP = {B_RUN: "run", B_STOP: "stop", B_STATUS: "status", B_PING: "ping",
-            B_ACC: "accounts", B_SET: "set", B_HIDE: "hide", B_DASH: "dashboard", B_BAL: "balance"}
+# ---------- KEYBOARDS (colored buttons, premium icons) ----------
+# cmd: (emoji, label, style)  style: success=green, primary=blue, danger=red
+BTN = {
+    "run": ("▶️", "Run", "success"),
+    "stop": ("🛑", "Stop", "danger"),
+    "status": ("📊", "Status", "primary"),
+    "ping": ("🏓", "Ping", "primary"),
+    "dashboard": ("💰", "Dashboard", "success"),
+    "balance": ("➕", "Insert balance", "primary"),
+    "accounts": ("👥", "Accounts", "primary"),
+    "set": ("🎯", "Set target", "primary"),
+    "hide": ("⌨️", "Hide", None),
+}
+TEXT_MAP = {}
+for _c, (_e, _l, _s) in BTN.items():
+    TEXT_MAP[_l] = _c
+    TEXT_MAP[f"{_e} {_l}"] = _c
+
+REMOVE_KB = {"remove_keyboard": True}
+
+
+def mk(emoji, label, style=None, **extra):
+    b = dict(extra)
+    key = emoji.replace("\ufe0f", "")
+    if PREMIUM_ON and key in PREMIUM:
+        b["text"] = label
+        b["icon_custom_emoji_id"] = PREMIUM[key]
+    else:
+        b["text"] = f"{emoji} {label}" if emoji else label
+    if style:
+        b["style"] = style
+    return b
+
+
+def rb(cmd):
+    e, l, s = BTN[cmd]
+    return mk(e, l, s)
 
 
 def reply_kb():
-    return [
-        [Button.text(B_RUN, resize=True), Button.text(B_STOP, resize=True)],
-        [Button.text(B_STATUS, resize=True), Button.text(B_PING, resize=True)],
-        [Button.text(B_DASH, resize=True), Button.text(B_BAL, resize=True)],
-        [Button.text(B_ACC, resize=True), Button.text(B_SET, resize=True)],
-        [Button.text(B_HIDE, resize=True)],
-    ]
+    rows = [["run", "stop"], ["status", "ping"], ["dashboard", "balance"], ["accounts", "set"], ["hide"]]
+    return {"keyboard": [[rb(c) for c in r] for r in rows], "resize_keyboard": True}
 
 
 def inline_main():
-    return [
-        [Button.inline("▶️ Run", b"run"), Button.inline("🛑 Stop", b"stop")],
-        [Button.inline("📊 Status", b"status"), Button.inline("🏓 Ping", b"ping")],
-        [Button.inline("💰 Dashboard", b"dashboard"), Button.inline("➕ Insert balance", b"balance")],
-        [Button.inline("👥 Accounts", b"accounts"), Button.inline("🎯 Set target", b"settarget")],
-        [Button.inline("⌨️ Hide keyboard", b"kbhide"), Button.inline("⌨️ Show keyboard", b"kbshow")],
-    ]
+    return {"inline_keyboard": [
+        [mk("▶️", "Run", "success", callback_data="run"), mk("🛑", "Stop", "danger", callback_data="stop")],
+        [mk("📊", "Status", "primary", callback_data="status"), mk("🏓", "Ping", "primary", callback_data="ping")],
+        [mk("💰", "Dashboard", "success", callback_data="dashboard"),
+         mk("➕", "Insert balance", "primary", callback_data="balance")],
+        [mk("👥", "Accounts", "primary", callback_data="accounts"),
+         mk("🎯", "Set target", "primary", callback_data="settarget")],
+        [mk("⌨️", "Hide keyboard", callback_data="kbhide"), mk("⌨️", "Show keyboard", callback_data="kbshow")],
+    ]}
 
 
 def inline_run():
-    return [[Button.inline("🛑 Stop", b"stop"), Button.inline("🏓 Ping", b"ping")]]
+    return {"inline_keyboard": [
+        [mk("🛑", "Stop", "danger", callback_data="stop"), mk("🏓", "Ping", "primary", callback_data="ping")],
+    ]}
 
 
 def inline_targets():
-    return [
-        [Button.inline("10", b"set:10"), Button.inline("25", b"set:25"),
-         Button.inline("50", b"set:50"), Button.inline("100", b"set:100")],
-        [Button.inline("🎲 Random", b"set:off"), Button.inline("⬅️ Back", b"back")],
-    ]
+    return {"inline_keyboard": [
+        [{"text": str(n), "callback_data": f"set:{n}", "style": "primary"} for n in (10, 25, 50, 100)],
+        [mk("🎲", "Random", callback_data="set:off"), mk("⬅️", "Back", callback_data="back")],
+    ]}
 
 
 # ---------- PROGRESS ----------
@@ -605,10 +789,6 @@ def is_running():
     return any(a.task and not a.task.done() for a in accs)
 
 
-async def say(text, buttons=None):
-    return await bot.send_message(ADMIN_ID, f"{BRAND}\n{text}"[:4000], buttons=buttons)
-
-
 async def progress_loop(msg):
     last = ""
     while True:
@@ -616,14 +796,10 @@ async def progress_loop(msg):
         text = render()
         if text != last:
             try:
-                await msg.edit(f"{BRAND}\n{text}", buttons=inline_run() if running else inline_main())
+                await edit_msg(msg, text, inline_run() if running else inline_main())
                 last = text
-            except MessageNotModifiedError:
-                pass
-            except FloodWaitError as e:
-                await asyncio.sleep(e.seconds)
             except Exception as e:
-                log.error(f"progress edit failed: {e!r}")
+                log.warning(f"progress edit failed: {e!r}")
         if not running:
             break
         await asyncio.sleep(PROGRESS_EVERY)
@@ -755,7 +931,7 @@ async def dispatch(cmd, arg=None):
         await say("⌨️ Keyboard on." if cmd == "menu" else HELP, reply_kb())
         return await say("Controls:", inline_main())
     if cmd == "hide":
-        return await say("⌨️ Keyboard hidden. Send /menu to show it again.", Button.clear())
+        return await say("⌨️ Keyboard hidden. Send /menu to show it again.", REMOVE_KB)
     if cmd == "run":
         return await act_run()
     if cmd == "stop":
@@ -813,7 +989,7 @@ async def alert_sender():
     while True:
         text = await alert_q.get()
         try:
-            await bot.send_message(ADMIN_ID, f"🚨 {text[:3800]}")
+            await say(f"🚨 {text[:3800]}")
         except Exception as e:
             print("alert send failed:", e)
         await asyncio.sleep(1)

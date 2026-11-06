@@ -122,12 +122,13 @@ _ah = AdminAlertHandler(level=logging.ERROR)
 _ah.setFormatter(_fmt)
 log.addHandler(_ah)
 
-# ---------- STATE (daily counts, earnings) ----------
+# ---------- STATE (daily counts, earnings, schedule) ----------
 REPLY_RATE = float(os.getenv("REPLY_RATE", "0.003"))
 DATA_DIR = os.getenv("DATA_DIR", ".")
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
 BRAND = "▰▰ 𝗖𝗟𝗘𝗫𝗘𝗥 ▰▰"
 AWAIT_BALANCE = False
+AWAIT_SCHEDULE = False
 
 
 def today_str():
@@ -144,11 +145,14 @@ def load_state():
 
 STATE = load_state()
 STATE.setdefault("date", today_str())
-STATE.setdefault("daily", {})     # user_id -> replies today
-STATE.setdefault("targets", {})   # user_id -> random target chosen today
-STATE.setdefault("history", {})   # date -> replies
-STATE.setdefault("base", 0.0)     # balance you inserted
-STATE.setdefault("since", 0)      # replies counted since that balance was set
+STATE.setdefault("daily", {})        # user_id -> replies today
+STATE.setdefault("targets", {})      # user_id -> random target chosen today
+STATE.setdefault("history", {})      # date -> replies
+STATE.setdefault("base", 0.0)        # balance you inserted
+STATE.setdefault("since", 0)         # replies counted since that balance was set
+STATE.setdefault("auto_run", False)  # scheduled daily run on/off
+STATE.setdefault("run_time", None)   # "HH:MM" 24h IST
+STATE.setdefault("last_auto_date", "")
 
 
 def save_state():
@@ -220,6 +224,28 @@ def dashboard():
         n = day_done(a.user_id)
         lines.append(f"   @{a.username}: {n}/{daily_target(a.user_id)} → {money(n * REPLY_RATE)}")
     return "\n".join(lines)
+
+
+def parse_time(text):
+    """Accepts '2:00 am', '5 pm', '14:00', '2am'. Returns 'HH:MM' (24h) or None."""
+    text = text.strip().lower()
+    m = re.match(r"^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$", text)
+    if not m:
+        return None
+    h, mi, ap = int(m.group(1)), int(m.group(2) or 0), m.group(3)
+    if mi > 59:
+        return None
+    if ap:
+        if not (1 <= h <= 12):
+            return None
+        if ap == "am":
+            h = 0 if h == 12 else h
+        else:
+            h = 12 if h == 12 else h + 12
+    else:
+        if not (0 <= h <= 23):
+            return None
+    return f"{h:02d}:{mi:02d}"
 
 
 # ---------- QUESTIONS ----------
@@ -689,6 +715,9 @@ BTN = {
     "balance": ("➕", "Insert balance", "primary"),
     "accounts": ("👥", "Accounts", "primary"),
     "set": ("🎯", "Set target", "primary"),
+    "autorun": ("🔁", "Auto-Run", "primary"),
+    "schedule": ("⏰", "Schedule", "primary"),
+    "reset": ("🔄", "Reset Today", "danger"),
     "hide": ("⌨️", "Hide", None),
 }
 TEXT_MAP = {}
@@ -718,11 +747,14 @@ def rb(cmd):
 
 
 def reply_kb():
-    rows = [["run", "stop"], ["status", "ping"], ["dashboard", "balance"], ["accounts", "set"], ["hide"]]
+    rows = [["run", "stop"], ["status", "ping"], ["dashboard", "balance"],
+            ["accounts", "set"], ["autorun", "schedule"], ["reset", "hide"]]
     return {"keyboard": [[rb(c) for c in r] for r in rows], "resize_keyboard": True}
 
 
 def inline_main():
+    auto_label = "🔁 Auto-Run: ON" if STATE["auto_run"] else "🔁 Auto-Run: OFF"
+    auto_style = "success" if STATE["auto_run"] else "danger"
     return {"inline_keyboard": [
         [mk("▶️", "Run", "success", callback_data="run"), mk("🛑", "Stop", "danger", callback_data="stop")],
         [mk("📊", "Status", "primary", callback_data="status"), mk("🏓", "Ping", "primary", callback_data="ping")],
@@ -730,6 +762,9 @@ def inline_main():
          mk("➕", "Insert balance", "primary", callback_data="balance")],
         [mk("👥", "Accounts", "primary", callback_data="accounts"),
          mk("🎯", "Set target", "primary", callback_data="settarget")],
+        [{"text": auto_label, "style": auto_style, "callback_data": "autorun"},
+         mk("⏰", "Schedule", "primary", callback_data="schedule")],
+        [mk("🔄", "Reset Today", "danger", callback_data="reset")],
         [mk("⌨️", "Hide keyboard", callback_data="kbhide"), mk("⌨️", "Show keyboard", callback_data="kbshow")],
     ]}
 
@@ -762,7 +797,8 @@ def render():
     tot = sum(a.target for a in active)
     done = sum(a.done for a in active)
     mode = f"fixed {FIXED_TARGET}" if FIXED_TARGET else f"random {DAILY_MIN}-{DAILY_MAX}"
-    lines = [f"📊 Progress ({mode})\n{bar(done, tot)}  {done}/{tot}\n"]
+    sched = f"\n⏰ Auto-Run: {'ON' if STATE['auto_run'] else 'OFF'}" + (f" at {STATE['run_time']} IST" if STATE["run_time"] else "")
+    lines = [f"📊 Progress ({mode}){sched}\n{bar(done, tot)}  {done}/{tot}\n"]
     for a in accs:
         if a.role in ("spare", "dead"):
             continue
@@ -921,9 +957,55 @@ async def act_balance(arg=None):
     await say(f"✅ Balance set to {money(val)}. Each new reply adds {money(REPLY_RATE)}.\n\n" + dashboard(), inline_main())
 
 
+async def act_reset_today():
+    n = 0
+    for a in accs:
+        if a.task and not a.task.done():
+            a.task.cancel()
+            n += 1
+    ensure_today()
+    STATE["daily"] = {}
+    STATE["targets"] = {}
+    save_state()
+    for a in accs:
+        a.done = a.target = a.fails = a.cycles = 0
+        a.status = "idle"
+        a.error = ""
+    await say(f"🔄 Reset done. Stopped {n} running account(s). All accounts back to day 0/50.", inline_main())
+
+
+async def act_autorun_toggle():
+    STATE["auto_run"] = not STATE["auto_run"]
+    save_state()
+    if STATE["auto_run"] and not STATE["run_time"]:
+        await say("🔁 Auto-Run is ON, but no time is set yet. Tap ⏰ Schedule to pick a time.", inline_main())
+    else:
+        state_txt = "ON" if STATE["auto_run"] else "OFF"
+        time_txt = f" Scheduled for {STATE['run_time']} IST daily." if STATE["run_time"] else ""
+        await say(f"🔁 Auto-Run is now {state_txt}.{time_txt}", inline_main())
+
+
+async def act_schedule(arg=None):
+    global AWAIT_SCHEDULE
+    if not arg:
+        AWAIT_SCHEDULE = True
+        cur = f"\nCurrent: {STATE['run_time']} IST" if STATE["run_time"] else ""
+        return await say(f"⏰ Send the time to auto-run daily, example: 2:00 am or 5:00 pm{cur}")
+    t = parse_time(arg)
+    if not t:
+        return await say("Couldn't read that time. Try: 2:00 am, 5 pm, or 14:00")
+    AWAIT_SCHEDULE = False
+    STATE["run_time"] = t
+    save_state()
+    extra = "" if STATE["auto_run"] else "\nAuto-Run is currently OFF — tap 🔁 Auto-Run to turn it on."
+    await say(f"⏰ Scheduled daily run at {t} IST.{extra}", inline_main())
+
+
 HELP = ("Commands:\n/run /stop /status /ping\n/dashboard - earnings today and lifetime\n"
         "/balance 12.50 - insert current balance\n/accounts - strings per account, corrupt ones\n"
-        "/set 50 - replies per account\n/set off - random target\n/menu - show keyboard\n/hide - hide keyboard")
+        "/set 50 - replies per account\n/set off - random target\n"
+        "/autorun - toggle scheduled daily run\n/schedule 2:00 am - set the daily run time\n"
+        "/reset - reset today's counts to 0/50\n/menu - show keyboard\n/hide - hide keyboard")
 
 
 async def dispatch(cmd, arg=None):
@@ -948,17 +1030,25 @@ async def dispatch(cmd, arg=None):
         return await act_balance(arg)
     if cmd == "set":
         return await act_set(arg)
+    if cmd == "autorun":
+        return await act_autorun_toggle()
+    if cmd == "schedule":
+        return await act_schedule(arg)
+    if cmd == "reset":
+        return await act_reset_today()
 
 
 # ---------- HANDLERS ----------
 @bot.on(events.NewMessage(from_users=ADMIN_ID))
 async def h_msg(ev):
-    global AWAIT_BALANCE
+    global AWAIT_BALANCE, AWAIT_SCHEDULE
     t = (ev.raw_text or "").strip()
     if AWAIT_BALANCE and t and not t.startswith("/") and t not in TEXT_MAP:
         return await act_balance(t)
-    AWAIT_BALANCE = False
-    m = re.match(r"^/(\w+)(?:@\w+)?(?:\s+(\S+))?$", t)
+    if AWAIT_SCHEDULE and t and not t.startswith("/") and t not in TEXT_MAP:
+        return await act_schedule(t)
+    AWAIT_BALANCE = AWAIT_SCHEDULE = False
+    m = re.match(r"^/(\w+)(?:@\w+)?(?:\s+(.+))?$", t)
     if m:
         cmd, arg = m.group(1).lower(), m.group(2)
     else:
@@ -1003,13 +1093,40 @@ async def midnight_loop():
         prev = STATE["date"]
         if ensure_today():
             y = STATE["history"].get(prev, 0)
-            await say(f"🌅 New day (IST). Yesterday: {y} replies → {money(y * REPLY_RATE)}\nDaily counters reset.", inline_main())
+            stopped = 0
+            for a in accs:
+                if a.task and not a.task.done():
+                    a.task.cancel()
+                    stopped += 1
+            for a in accs:
+                a.done = a.target = a.fails = a.cycles = 0
+                a.status = "idle"
+                a.error = ""
+            await say(
+                f"🌅 New day (IST). Yesterday: {y} replies → {money(y * REPLY_RATE)}\n"
+                f"Stopped {stopped} leftover run(s). All accounts reset to day 0/50.",
+                inline_main(),
+            )
+
+
+async def schedule_loop():
+    while True:
+        await asyncio.sleep(30)
+        if not STATE.get("auto_run") or not STATE.get("run_time"):
+            continue
+        now = datetime.now(IST)
+        if now.strftime("%H:%M") == STATE["run_time"] and STATE.get("last_auto_date") != today_str():
+            STATE["last_auto_date"] = today_str()
+            save_state()
+            log.info(f"Auto-Run triggered at {STATE['run_time']} IST")
+            await act_run()
 
 
 async def main():
     await bot.start(bot_token=BOT_TOKEN)
     asyncio.create_task(alert_sender())
     asyncio.create_task(midnight_loop())
+    asyncio.create_task(schedule_loop())
     try:
         await bot.unpin_message(ADMIN_ID)
         cap = f"{BRAND}\n𝗖𝗟𝗘𝗫𝗘𝗥 — auto worker"

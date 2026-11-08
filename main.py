@@ -154,7 +154,7 @@ STATE.setdefault("since", 0)
 STATE.setdefault("auto_run", False)
 STATE.setdefault("run_time", None)
 STATE.setdefault("last_auto_date", "")
-STATE.setdefault("seen", [])   # questions already used today
+STATE.setdefault("seen", [])
 
 
 def save_state():
@@ -245,7 +245,7 @@ def parse_time(text):
     return f"{h:02d}:{mi:02d}"
 
 
-# ---------- QUESTIONS (150+ built-in, no-repeat per day) ----------
+# ---------- QUESTIONS ----------
 _Q_TOPICS = [
     "your service", "this bot", "your features", "pricing", "getting started", "your team",
     "updates", "support", "your product", "integrations", "security", "privacy",
@@ -626,13 +626,12 @@ async def say(text, buttons=None):
 
 async def edit_msg(msg_id, text, buttons=None):
     full = f"{BRAND}\n{text}"
-    if len(full) <= 4000:
-        p = _prep(full, buttons)
-        p.update(chat_id=ADMIN_ID, message_id=msg_id)
-        await _call("editMessageText", p)
-        return msg_id
-    # too long to fit one message: resend as fresh chunked message(s)
-    return await say(text, buttons)
+    if len(full) > 3900:
+        full = full[:3850] + "\n…(trimmed, see /status for full list)"
+    p = _prep(full, buttons)
+    p.update(chat_id=ADMIN_ID, message_id=msg_id)
+    await _call("editMessageText", p)
+    return msg_id
 
 
 async def safe_delete(msg_id):
@@ -876,11 +875,19 @@ def render():
     mode = f"fixed {FIXED_TARGET}" if FIXED_TARGET else f"random {DAILY_MIN}-{DAILY_MAX}"
     sched = f"\n⏰ Auto-Run: {'ON' if STATE['auto_run'] else 'OFF'}" + (f" at {STATE['run_time']} IST" if STATE["run_time"] else "")
     lines = [f"📊 Progress ({mode}){sched}\n{bar(done, tot)}  {done}/{tot}\n"]
+
+    detail, idle_n, done_n = [], 0, 0
     for a in accs:
         if a.role in ("spare", "dead"):
             continue
         if a.role != "primary":
-            lines.append(f"❌ {a.label} — {a.error or 'not connected'}")
+            detail.append(f"❌ {a.label} — {a.error or 'not connected'}")
+            continue
+        if a.status == "idle":
+            idle_n += 1
+            continue
+        if a.status == "done":
+            done_n += 1
             continue
         extra = ""
         if a.status == "cooldown":
@@ -890,10 +897,23 @@ def render():
         elif a.fails:
             extra = f" ⚠️ fail {a.fails}/{MAX_RETRIES}"
         dn, dt = day_done(a.user_id), daily_target(a.user_id)
-        lines.append(f"{ICON.get(a.status, '⚪')} {a.tag()} {bar(a.done, a.target, 10)} {a.done}/{a.target} · day {dn}/{dt}{extra}")
+        detail.append(f"{ICON.get(a.status, '⚪')} {a.tag()} {bar(a.done, a.target, 10)} {a.done}/{a.target} · day {dn}/{dt}{extra}")
+
+    MAX_LINES = 40
+    if len(detail) > MAX_LINES:
+        shown, hidden = detail[:MAX_LINES], len(detail) - MAX_LINES
+        lines += shown
+        lines.append(f"…and {hidden} more active account(s)")
+    else:
+        lines += detail
+
+    if idle_n:
+        lines.append(f"⚪ {idle_n} account(s) queued, not started yet")
+    if done_n:
+        lines.append(f"✅ {done_n} account(s) finished this run")
     spare = sum(1 for a in accs if a.role == "spare")
     if spare:
-        lines.append(f"\n⚪ {spare} spare string(s) on standby")
+        lines.append(f"⚪ {spare} spare string(s) on standby")
     lines.append(f"\n🕒 {datetime.now(IST).strftime('%H:%M:%S')} IST")
     return "\n".join(lines)
 

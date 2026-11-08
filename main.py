@@ -29,7 +29,7 @@ MAX_DELAY = int(os.getenv("MAX_DELAY", "90"))
 PROGRESS_EVERY = int(os.getenv("PROGRESS_EVERY", "5"))
 CONN_TRIES = int(os.getenv("CONN_TRIES", "4"))
 CONN_DELAYS = [10, 30, 60, 120]
-STAGGER = int(os.getenv("STAGGER", "0"))   # 0 = all accounts start at the same time
+STAGGER = int(os.getenv("STAGGER", "0"))
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
@@ -93,7 +93,7 @@ def save_names(d):
 
 NAMES = load_names()
 
-# ---------- LOGGING (ERROR -> admin DM, same error only once per hour) ----------
+# ---------- LOGGING ----------
 alert_q: asyncio.Queue = asyncio.Queue()
 _recent: dict = {}
 
@@ -122,13 +122,14 @@ _ah = AdminAlertHandler(level=logging.ERROR)
 _ah.setFormatter(_fmt)
 log.addHandler(_ah)
 
-# ---------- STATE (daily counts, earnings, schedule) ----------
+# ---------- STATE ----------
 REPLY_RATE = float(os.getenv("REPLY_RATE", "0.003"))
 DATA_DIR = os.getenv("DATA_DIR", ".")
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
 BRAND = "▰▰ 𝗖𝗟𝗘𝗫𝗘𝗥 ▰▰"
 AWAIT_BALANCE = False
 AWAIT_SCHEDULE = False
+AWAIT_BROADCAST = False
 
 
 def today_str():
@@ -145,14 +146,15 @@ def load_state():
 
 STATE = load_state()
 STATE.setdefault("date", today_str())
-STATE.setdefault("daily", {})        # user_id -> replies today
-STATE.setdefault("targets", {})      # user_id -> random target chosen today
-STATE.setdefault("history", {})      # date -> replies
-STATE.setdefault("base", 0.0)        # balance you inserted
-STATE.setdefault("since", 0)         # replies counted since that balance was set
-STATE.setdefault("auto_run", False)  # scheduled daily run on/off
-STATE.setdefault("run_time", None)   # "HH:MM" 24h IST
+STATE.setdefault("daily", {})
+STATE.setdefault("targets", {})
+STATE.setdefault("history", {})
+STATE.setdefault("base", 0.0)
+STATE.setdefault("since", 0)
+STATE.setdefault("auto_run", False)
+STATE.setdefault("run_time", None)
 STATE.setdefault("last_auto_date", "")
+STATE.setdefault("seen", [])   # questions already used today
 
 
 def save_state():
@@ -165,12 +167,11 @@ def save_state():
 
 
 def ensure_today():
-    """Rolls the day at 00:00 IST. Returns True if a new day started."""
     t = today_str()
     if STATE["date"] != t:
         STATE["history"][STATE["date"]] = sum(STATE["daily"].values())
         STATE["history"] = dict(sorted(STATE["history"].items())[-30:])
-        STATE["daily"], STATE["targets"], STATE["date"] = {}, {}, t
+        STATE["daily"], STATE["targets"], STATE["date"], STATE["seen"] = {}, {}, t, []
         save_state()
         return True
     return False
@@ -227,7 +228,6 @@ def dashboard():
 
 
 def parse_time(text):
-    """Accepts '2:00 am', '5 pm', '14:00', '2am'. Returns 'HH:MM' (24h) or None."""
     text = text.strip().lower()
     m = re.match(r"^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$", text)
     if not m:
@@ -238,39 +238,53 @@ def parse_time(text):
     if ap:
         if not (1 <= h <= 12):
             return None
-        if ap == "am":
-            h = 0 if h == 12 else h
-        else:
-            h = 12 if h == 12 else h + 12
+        h = (0 if h == 12 else h) if ap == "am" else (12 if h == 12 else h + 12)
     else:
         if not (0 <= h <= 23):
             return None
     return f"{h:02d}:{mi:02d}"
 
 
-# ---------- QUESTIONS ----------
-FALLBACK = [
-    "hi", "hello", "how are you?", "what can you do?", "help me", "show menu",
-    "what is your name?", "tell me something interesting", "how does this work?",
-    "can you explain that again?", "what are your features?", "is this free?",
-    "give me a quick tip", "what's new today?", "how do I get started?",
-    "can you help me with something?", "tell me a fun fact", "what should I try first?",
-    "how do I contact support?", "what are the commands?", "is there a guide?",
-    "what is the best way to use you?", "can you recommend something?",
-    "thanks, what next?", "explain in simple words", "what can I ask you?",
-    "do you have any examples?", "how fast are you?", "are you online?",
-    "give me one more idea",
+# ---------- QUESTIONS (150+ built-in, no-repeat per day) ----------
+_Q_TOPICS = [
+    "your service", "this bot", "your features", "pricing", "getting started", "your team",
+    "updates", "support", "your product", "integrations", "security", "privacy",
+    "the mobile app", "your community", "feedback", "your roadmap", "tips", "best practices",
+    "troubleshooting", "your API", "documentation", "your plans", "a free trial",
+    "your company", "your mission", "case studies", "your blog", "your newsletter",
+    "your socials", "your website", "this platform", "automation", "your workflow",
+    "customization", "your dashboard", "notifications", "your settings", "account setup",
+    "your onboarding", "your FAQ",
 ]
+_Q_TEMPLATES = [
+    "What is {t}?", "Can you explain {t}?", "Tell me about {t}", "How does {t} work?",
+    "Why should I care about {t}?", "Any tips on {t}?", "What's new with {t}?",
+    "Can you help me understand {t}?", "Where can I learn about {t}?",
+    "What do you think about {t}?",
+]
+
+
+def build_fallback():
+    out = [tpl.format(t=t) for t in _Q_TOPICS for tpl in _Q_TEMPLATES]
+    random.shuffle(out)
+    return out[:150]
+
+
+FALLBACK = build_fallback()
 pool: list = []
 pool_lock = asyncio.Lock()
 
 
-async def gemini_questions() -> list:
+async def gemini_questions(avoid=None) -> list:
     if not GEMINI_KEY:
         return []
+    avoid = list(avoid or [])[-20:]
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}"
     prompt = (f"Generate 30 different short, casual questions a normal user might ask a chatbot about "
-              f"{QUESTION_TOPIC}. Vary length and wording. Return only a JSON array of strings.")
+              f"{QUESTION_TOPIC}. Vary length and wording.")
+    if avoid:
+        prompt += " Do not repeat any of these already-used questions: " + " | ".join(avoid)
+    prompt += " Return only a JSON array of strings."
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"responseMimeType": "application/json"}}
     async with aiohttp.ClientSession() as s:
@@ -284,17 +298,29 @@ async def gemini_questions() -> list:
 
 async def next_question() -> str:
     async with pool_lock:
-        if not pool:
-            qs = []
-            try:
-                qs = await gemini_questions()
-            except Exception as e:
-                log.warning(f"Gemini failed, using fallback: {e}")
-            if not qs:
-                qs = FALLBACK[:]
-            random.shuffle(qs)
-            pool.extend(qs)
-        return pool.pop()
+        ensure_today()
+        seen = set(STATE.get("seen", []))
+        q = None
+        for _ in range(300):
+            if not pool:
+                qs = []
+                try:
+                    qs = await gemini_questions(STATE.get("seen"))
+                except Exception as e:
+                    log.warning(f"Gemini failed, using fallback: {e}")
+                if not qs:
+                    qs = FALLBACK[:]
+                random.shuffle(qs)
+                pool.extend(qs)
+            cand = pool.pop()
+            if cand not in seen:
+                q = cand
+                break
+        if q is None:
+            q = random.choice(FALLBACK)
+        STATE["seen"] = (STATE.get("seen", []) + [q])[-500:]
+        save_state()
+        return q
 
 
 # ---------- ACCOUNT STATE ----------
@@ -309,14 +335,14 @@ class Acc:
     username: str = ""
     last_user: str = ""
     dup_of: str = ""
-    role: str = "new"      # primary spare broken dead
+    role: str = "new"
     ready: bool = False
     error: str = ""
-    target: int = 0        # replies to do in THIS run (remaining for today)
-    done: int = 0          # replies done in THIS run
+    target: int = 0
+    done: int = 0
     fails: int = 0
     cycles: int = 0
-    status: str = "idle"   # idle running cooldown done stopped error
+    status: str = "idle"
     task: Optional[asyncio.Task] = None
     next_retry: float = 0.0
 
@@ -330,7 +356,7 @@ for i, (lab, raw) in enumerate(ENTRIES):
     label, sess = parse_entry(lab, raw)
     accs.append(Acc(i, label, sess, group=label.split("__")[0], last_user=NAMES.get(label, "")))
 
-GROUPS: dict = {}   # telegram user_id -> [valid Acc sorted by idx]
+GROUPS: dict = {}
 bot = TelegramClient(StringSession(), API_ID, API_HASH)
 progress_task: Optional[asyncio.Task] = None
 
@@ -385,7 +411,6 @@ async def connect(acc: Acc, seen: dict):
         log.warning(f"[{acc.label}] connect failed: {acc.error}")
 
 
-# ---------- GROUPING (one account = one active string) ----------
 async def organize():
     GROUPS.clear()
     for a in accs:
@@ -405,7 +430,6 @@ async def organize():
 
 
 def owner_of(a: Acc):
-    """Find which working account a broken string belongs to (exact duplicate, name group, or last known @user)."""
     if a.dup_of:
         o = next((x for x in accs if x.label == a.dup_of and x.user_id), None)
         if o:
@@ -465,7 +489,6 @@ def accounts_report():
 
 
 async def promote(dead: Acc):
-    """Switch to a spare string of the same account."""
     for sp in GROUPS.get(dead.user_id, []):
         if sp is dead or sp.role != "spare":
             continue
@@ -485,7 +508,7 @@ async def promote(dead: Acc):
     return None
 
 
-# ---------- BOT API SENDER (premium emojis + colored buttons) ----------
+# ---------- BOT API SENDER ----------
 BOT_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 _http: Optional[aiohttp.ClientSession] = None
 
@@ -517,7 +540,6 @@ async def api(method, **params):
 
 
 def with_premium(text):
-    """Entities that turn known emojis into premium custom emojis (offsets in UTF-16 units)."""
     ents, off, i = [], 0, 0
     while i < len(text):
         ch = text[i]
@@ -541,13 +563,31 @@ def strip_icons(m):
     return m
 
 
+def chunk_text(text, limit=3500):
+    if len(text) <= limit:
+        return [text]
+    parts, cur = [], ""
+    for line in text.split("\n"):
+        if len(cur) + len(line) + 1 > limit:
+            if cur:
+                parts.append(cur)
+            cur = line
+            while len(cur) > limit:
+                parts.append(cur[:limit])
+                cur = cur[limit:]
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        parts.append(cur)
+    return parts
+
+
 def _prep(text, markup):
-    text = f"{BRAND}\n{text}"[:4000]
-    p = {"text": text}
+    p = {"text": text[:4000]}
     if markup:
         p["reply_markup"] = markup
     if PREMIUM_ON:
-        ents = with_premium(text)
+        ents = with_premium(p["text"])
         if ents:
             p["entities"] = ents
     return p
@@ -573,16 +613,26 @@ async def _call(method, p):
 
 
 async def say(text, buttons=None):
-    p = _prep(text, buttons)
-    p["chat_id"] = ADMIN_ID
-    r = await _call("sendMessage", p)
-    return r["message_id"] if r else None
+    full = f"{BRAND}\n{text}"
+    chunks = chunk_text(full, 3900)
+    last_id = None
+    for i, c in enumerate(chunks):
+        p = _prep(c, buttons if i == len(chunks) - 1 else None)
+        p["chat_id"] = ADMIN_ID
+        r = await _call("sendMessage", p)
+        last_id = r["message_id"] if r else last_id
+    return last_id
 
 
 async def edit_msg(msg_id, text, buttons=None):
-    p = _prep(text, buttons)
-    p.update(chat_id=ADMIN_ID, message_id=msg_id)
-    await _call("editMessageText", p)
+    full = f"{BRAND}\n{text}"
+    if len(full) <= 4000:
+        p = _prep(full, buttons)
+        p.update(chat_id=ADMIN_ID, message_id=msg_id)
+        await _call("editMessageText", p)
+        return msg_id
+    # too long to fit one message: resend as fresh chunked message(s)
+    return await say(text, buttons)
 
 
 async def safe_delete(msg_id):
@@ -704,8 +754,33 @@ async def run_account(acc: Acc):
         raise
 
 
-# ---------- KEYBOARDS (colored buttons, premium icons) ----------
-# cmd: (emoji, label, style)  style: success=green, primary=blue, danger=red
+# ---------- BROADCAST ----------
+async def broadcast_one(acc: Acc, text: str):
+    if not acc.ready or acc.role != "primary":
+        return False
+    try:
+        if not acc.client.is_connected():
+            await acc.client.connect()
+        async with acc.client.conversation(TARGET_BOT, timeout=REPLY_TIMEOUT) as conv:
+            await conv.send_message(text)
+            await conv.get_response()
+        return True
+    except Exception as e:
+        log.warning(f"[{acc.tag()}] broadcast failed: {e!r}")
+        return False
+
+
+async def do_broadcast(text: str):
+    targets = [a for a in primaries() if a.ready]
+    if not targets:
+        return await say("No working accounts to broadcast to.", inline_main())
+    await say(f"📣 Sending to {len(targets)} account(s) now…")
+    results = await asyncio.gather(*(broadcast_one(a, text) for a in targets))
+    ok = sum(1 for r in results if r)
+    await say(f"📣 Broadcast done: {ok}/{len(targets)} accounts got a reply.", inline_main())
+
+
+# ---------- KEYBOARDS ----------
 BTN = {
     "run": ("▶️", "Run", "success"),
     "stop": ("🛑", "Stop", "danger"),
@@ -717,6 +792,7 @@ BTN = {
     "set": ("🎯", "Set target", "primary"),
     "autorun": ("🔁", "Auto-Run", "primary"),
     "schedule": ("⏰", "Schedule", "primary"),
+    "broadcast": ("📣", "Broadcast", "primary"),
     "reset": ("🔄", "Reset Today", "danger"),
     "hide": ("⌨️", "Hide", None),
 }
@@ -748,7 +824,7 @@ def rb(cmd):
 
 def reply_kb():
     rows = [["run", "stop"], ["status", "ping"], ["dashboard", "balance"],
-            ["accounts", "set"], ["autorun", "schedule"], ["reset", "hide"]]
+            ["accounts", "set"], ["autorun", "schedule"], ["broadcast", "reset"], ["hide"]]
     return {"keyboard": [[rb(c) for c in r] for r in rows], "resize_keyboard": True}
 
 
@@ -764,6 +840,7 @@ def inline_main():
          mk("🎯", "Set target", "primary", callback_data="settarget")],
         [{"text": auto_label, "style": auto_style, "callback_data": "autorun"},
          mk("⏰", "Schedule", "primary", callback_data="schedule")],
+        [mk("📣", "Broadcast", "primary", callback_data="broadcast")],
         [mk("🔄", "Reset Today", "danger", callback_data="reset")],
         [mk("⌨️", "Hide keyboard", callback_data="kbhide"), mk("⌨️", "Show keyboard", callback_data="kbshow")],
     ]}
@@ -832,7 +909,7 @@ async def progress_loop(msg):
         text = render()
         if text != last:
             try:
-                await edit_msg(msg, text, inline_run() if running else inline_main())
+                msg = await edit_msg(msg, text, inline_run() if running else inline_main())
                 last = text
             except Exception as e:
                 log.warning(f"progress edit failed: {e!r}")
@@ -1001,10 +1078,20 @@ async def act_schedule(arg=None):
     await say(f"⏰ Scheduled daily run at {t} IST.{extra}", inline_main())
 
 
+async def act_broadcast(arg=None):
+    global AWAIT_BROADCAST
+    if not arg:
+        AWAIT_BROADCAST = True
+        return await say("📣 Send the message to broadcast to all accounts now (doesn't count toward 50/day).")
+    AWAIT_BROADCAST = False
+    await do_broadcast(arg)
+
+
 HELP = ("Commands:\n/run /stop /status /ping\n/dashboard - earnings today and lifetime\n"
         "/balance 12.50 - insert current balance\n/accounts - strings per account, corrupt ones\n"
         "/set 50 - replies per account\n/set off - random target\n"
         "/autorun - toggle scheduled daily run\n/schedule 2:00 am - set the daily run time\n"
+        "/broadcast <msg> - send one message to all accounts right now\n"
         "/reset - reset today's counts to 0/50\n/menu - show keyboard\n/hide - hide keyboard")
 
 
@@ -1034,6 +1121,8 @@ async def dispatch(cmd, arg=None):
         return await act_autorun_toggle()
     if cmd == "schedule":
         return await act_schedule(arg)
+    if cmd == "broadcast":
+        return await act_broadcast(arg)
     if cmd == "reset":
         return await act_reset_today()
 
@@ -1041,13 +1130,16 @@ async def dispatch(cmd, arg=None):
 # ---------- HANDLERS ----------
 @bot.on(events.NewMessage(from_users=ADMIN_ID))
 async def h_msg(ev):
-    global AWAIT_BALANCE, AWAIT_SCHEDULE
+    global AWAIT_BALANCE, AWAIT_SCHEDULE, AWAIT_BROADCAST
     t = (ev.raw_text or "").strip()
+    if AWAIT_BROADCAST and t and not t.startswith("/") and t not in TEXT_MAP:
+        AWAIT_BROADCAST = False
+        return await do_broadcast(t)
     if AWAIT_BALANCE and t and not t.startswith("/") and t not in TEXT_MAP:
         return await act_balance(t)
     if AWAIT_SCHEDULE and t and not t.startswith("/") and t not in TEXT_MAP:
         return await act_schedule(t)
-    AWAIT_BALANCE = AWAIT_SCHEDULE = False
+    AWAIT_BALANCE = AWAIT_SCHEDULE = AWAIT_BROADCAST = False
     m = re.match(r"^/(\w+)(?:@\w+)?(?:\s+(.+))?$", t)
     if m:
         cmd, arg = m.group(1).lower(), m.group(2)

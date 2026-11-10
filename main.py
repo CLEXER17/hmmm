@@ -30,6 +30,7 @@ PROGRESS_EVERY = int(os.getenv("PROGRESS_EVERY", "5"))
 CONN_TRIES = int(os.getenv("CONN_TRIES", "4"))
 CONN_DELAYS = [10, 30, 60, 120]
 STAGGER = int(os.getenv("STAGGER", "0"))
+PAGE_SIZE = int(os.getenv("PAGE_SIZE", "25"))
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
@@ -130,6 +131,7 @@ BRAND = "▰▰ 𝗖𝗟𝗘𝗫𝗘𝗥 ▰▰"
 AWAIT_BALANCE = False
 AWAIT_SCHEDULE = False
 AWAIT_BROADCAST = False
+PAGE = {"n": 0}
 
 
 def today_str():
@@ -456,8 +458,8 @@ def describe_broken(a: Acc):
     return f"❌ {a.label}{who} — owner unknown. {a.error}"
 
 
-def accounts_report():
-    lines = [f"👥 {len(accs)} strings → {len(GROUPS)} unique working account(s)"]
+def accounts_report_pages():
+    header = f"👥 {len(accs)} strings → {len(GROUPS)} unique working account(s)"
     bad_by_owner, unknown = {}, []
     for a in accs:
         if a.ready:
@@ -467,25 +469,37 @@ def accounts_report():
             bad_by_owner.setdefault(uid, []).append(a)
         else:
             unknown.append(a)
+    blocks = []
     for uid, lst in GROUPS.items():
         bad = bad_by_owner.get(uid, [])
         total = len(lst) + len(bad)
         if total == 1:
-            lines.append(f"\n👤 @{lst[0].username} — 1 string ✅")
+            blocks.append(f"👤 @{lst[0].username} — 1 string ✅")
             continue
-        head = f"\n👤 @{lst[0].username} — {total} strings: {len(lst)} valid"
-        head += f", {len(bad)} CORRUPT" if bad else ""
-        lines.append(head)
+        lines = [f"👤 @{lst[0].username} — {total} strings: {len(lst)} valid" + (f", {len(bad)} CORRUPT" if bad else "")]
         for a in lst:
             lines.append(f"   {'✅ in use' if a.role == 'primary' else '⚪ spare'}: {a.label}")
         for a in bad:
             lines.append(f"   ❌ CORRUPT: {a.label} — {a.error}")
+        blocks.append("\n".join(lines))
     if unknown:
-        lines.append("\n❌ Broken strings, owner unknown (rename extra strings NAME__2 to match):")
+        lines = ["❌ Broken strings, owner unknown (rename extra strings NAME__2 to match):"]
         for a in unknown:
             who = f" (last known @{a.last_user})" if a.last_user else ""
             lines.append(f"   • {a.label}{who} — {a.error}")
-    return "\n".join(lines)
+        blocks.append("\n".join(lines))
+
+    pages, cur = [], [header]
+    cur_len = len(header)
+    for b in blocks:
+        if cur_len + len(b) + 2 > 3200 and len(cur) > 1:
+            pages.append("\n\n".join(cur))
+            cur, cur_len = [header], len(header)
+        cur.append(b)
+        cur_len += len(b) + 2
+    if cur:
+        pages.append("\n\n".join(cur))
+    return pages or [header]
 
 
 async def promote(dead: Acc):
@@ -627,7 +641,7 @@ async def say(text, buttons=None):
 async def edit_msg(msg_id, text, buttons=None):
     full = f"{BRAND}\n{text}"
     if len(full) > 3900:
-        full = full[:3850] + "\n…(trimmed, see /status for full list)"
+        full = full[:3850] + "\n…(trimmed)"
     p = _prep(full, buttons)
     p.update(chat_id=ADMIN_ID, message_id=msg_id)
     await _call("editMessageText", p)
@@ -792,6 +806,7 @@ BTN = {
     "autorun": ("🔁", "Auto-Run", "primary"),
     "schedule": ("⏰", "Schedule", "primary"),
     "broadcast": ("📣", "Broadcast", "primary"),
+    "issues": ("⚠️", "Issues", "danger"),
     "reset": ("🔄", "Reset Today", "danger"),
     "hide": ("⌨️", "Hide", None),
 }
@@ -823,7 +838,8 @@ def rb(cmd):
 
 def reply_kb():
     rows = [["run", "stop"], ["status", "ping"], ["dashboard", "balance"],
-            ["accounts", "set"], ["autorun", "schedule"], ["broadcast", "reset"], ["hide"]]
+            ["accounts", "set"], ["autorun", "schedule"], ["broadcast", "reset"],
+            ["issues", "hide"]]
     return {"keyboard": [[rb(c) for c in r] for r in rows], "resize_keyboard": True}
 
 
@@ -840,15 +856,23 @@ def inline_main():
         [{"text": auto_label, "style": auto_style, "callback_data": "autorun"},
          mk("⏰", "Schedule", "primary", callback_data="schedule")],
         [mk("📣", "Broadcast", "primary", callback_data="broadcast")],
+        [mk("⚠️", "Issues", "danger", callback_data="issues")],
         [mk("🔄", "Reset Today", "danger", callback_data="reset")],
         [mk("⌨️", "Hide keyboard", callback_data="kbhide"), mk("⌨️", "Show keyboard", callback_data="kbshow")],
     ]}
 
 
-def inline_run():
-    return {"inline_keyboard": [
-        [mk("🛑", "Stop", "danger", callback_data="stop"), mk("🏓", "Ping", "primary", callback_data="ping")],
-    ]}
+def inline_run(page, total_pages):
+    nav = []
+    if total_pages > 1:
+        nav.append(mk("⬅️", "Prev", "primary", callback_data="page:prev"))
+        nav.append({"text": f"{page + 1}/{total_pages}", "callback_data": "noop", "style": "primary"})
+        nav.append(mk("➡️", "Next", "primary", callback_data="page:next"))
+    rows = [[mk("🛑", "Stop", "danger", callback_data="stop"), mk("🏓", "Ping", "primary", callback_data="ping")]]
+    if nav:
+        rows.append(nav)
+    rows.append([mk("⚠️", "Issues", "danger", callback_data="issues")])
+    return {"inline_keyboard": rows}
 
 
 def inline_targets():
@@ -858,7 +882,18 @@ def inline_targets():
     ]}
 
 
-# ---------- PROGRESS ----------
+def inline_pages(page, total_pages, base="acc"):
+    if total_pages <= 1:
+        return inline_main()
+    return {"inline_keyboard": [
+        [mk("⬅️", "Prev", "primary", callback_data=f"{base}page:prev"),
+         {"text": f"{page + 1}/{total_pages}", "callback_data": "noop", "style": "primary"},
+         mk("➡️", "Next", "primary", callback_data=f"{base}page:next")],
+        [mk("⬅️", "Back", callback_data="back")],
+    ]}
+
+
+# ---------- PROGRESS (paginated) ----------
 ICON = {"idle": "⚪", "running": "🟢", "cooldown": "🟡", "done": "✅", "stopped": "🔴", "error": "❌"}
 
 
@@ -868,26 +903,13 @@ def bar(done, total, w=20):
     return "█" * f + "░" * (w - f) + f" {int(p * 100)}%"
 
 
-def render():
-    active = primaries()
-    tot = sum(a.target for a in active)
-    done = sum(a.done for a in active)
-    mode = f"fixed {FIXED_TARGET}" if FIXED_TARGET else f"random {DAILY_MIN}-{DAILY_MAX}"
-    sched = f"\n⏰ Auto-Run: {'ON' if STATE['auto_run'] else 'OFF'}" + (f" at {STATE['run_time']} IST" if STATE["run_time"] else "")
-    lines = [f"📊 Progress ({mode}){sched}\n{bar(done, tot)}  {done}/{tot}\n"]
-
-    detail, idle_n, done_n = [], 0, 0
+def account_lines():
+    out = []
     for a in accs:
         if a.role in ("spare", "dead"):
             continue
         if a.role != "primary":
-            detail.append(f"❌ {a.label} — {a.error or 'not connected'}")
-            continue
-        if a.status == "idle":
-            idle_n += 1
-            continue
-        if a.status == "done":
-            done_n += 1
+            out.append((a, f"❌ {a.label} — {a.error or 'not connected'}"))
             continue
         extra = ""
         if a.status == "cooldown":
@@ -897,39 +919,75 @@ def render():
         elif a.fails:
             extra = f" ⚠️ fail {a.fails}/{MAX_RETRIES}"
         dn, dt = day_done(a.user_id), daily_target(a.user_id)
-        detail.append(f"{ICON.get(a.status, '⚪')} {a.tag()} {bar(a.done, a.target, 10)} {a.done}/{a.target} · day {dn}/{dt}{extra}")
+        out.append((a, f"{ICON.get(a.status, '⚪')} {a.tag()} {bar(a.done, a.target, 10)} {a.done}/{a.target} · day {dn}/{dt}{extra}"))
+    return out
 
-    MAX_LINES = 40
-    if len(detail) > MAX_LINES:
-        shown, hidden = detail[:MAX_LINES], len(detail) - MAX_LINES
-        lines += shown
-        lines.append(f"…and {hidden} more active account(s)")
-    else:
-        lines += detail
 
-    if idle_n:
-        lines.append(f"⚪ {idle_n} account(s) queued, not started yet")
-    if done_n:
-        lines.append(f"✅ {done_n} account(s) finished this run")
+def render_page(page: int):
+    active = primaries()
+    tot = sum(a.target for a in active)
+    done = sum(a.done for a in active)
+    mode = f"fixed {FIXED_TARGET}" if FIXED_TARGET else f"random {DAILY_MIN}-{DAILY_MAX}"
+    sched = f"\n⏰ Auto-Run: {'ON' if STATE['auto_run'] else 'OFF'}" + (f" at {STATE['run_time']} IST" if STATE["run_time"] else "")
+
+    all_lines = account_lines()
+    total_pages = max(1, (len(all_lines) + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * PAGE_SIZE
+    page_items = all_lines[start:start + PAGE_SIZE]
+
+    needs_attention = [a for a, _ in all_lines[:start] + all_lines[start + PAGE_SIZE:]
+                        if a.status in ("cooldown", "error") or a.fails]
+
+    lines = [f"📊 Progress ({mode}){sched}\n{bar(done, tot)}  {done}/{tot}",
+             f"Page {page + 1}/{total_pages} · showing {len(page_items)} of {len(all_lines)} account(s)\n"]
+    lines += [text for _, text in page_items]
+
     spare = sum(1 for a in accs if a.role == "spare")
     if spare:
-        lines.append(f"⚪ {spare} spare string(s) on standby")
+        lines.append(f"\n⚪ {spare} spare string(s) on standby")
+    if needs_attention:
+        lines.append(f"\n⚠️ {len(needs_attention)} account(s) on other pages need attention — tap Issues")
+    lines.append(f"\n🕒 {datetime.now(IST).strftime('%H:%M:%S')} IST")
+    return "\n".join(lines), page, total_pages
+
+
+def render_issues():
+    all_lines = account_lines()
+    issues = [(a, t) for a, t in all_lines if a.status in ("cooldown", "error", "stopped") or a.fails or a.role == "broken"]
+    if not issues:
+        return "⚠️ Issues\n\nNo accounts currently have issues. ✅"
+    lines = [f"⚠️ Issues ({len(issues)})\n"]
+    lines += [t for _, t in issues]
     lines.append(f"\n🕒 {datetime.now(IST).strftime('%H:%M:%S')} IST")
     return "\n".join(lines)
+
+
+def issues_count():
+    all_lines = account_lines()
+    return sum(1 for a, _ in all_lines if a.status in ("cooldown", "error", "stopped") or a.fails or a.role == "broken")
 
 
 def is_running():
     return any(a.task and not a.task.done() for a in accs)
 
 
+_last_issue_count = 0
+
+
 async def progress_loop(msg):
+    global _last_issue_count
     last = ""
     while True:
         running = is_running()
-        text = render()
+        cur_issues = issues_count()
+        if cur_issues > _last_issue_count:
+            await say(f"⚠️ New issue detected — {cur_issues} account(s) now need attention. Tap ⚠️ Issues to view.", inline_main())
+        _last_issue_count = cur_issues
+        text, page, total_pages = render_page(PAGE["n"])
         if text != last:
             try:
-                msg = await edit_msg(msg, text, inline_run() if running else inline_main())
+                msg = await edit_msg(msg, text, inline_run(page, total_pages) if running else inline_main())
                 last = text
             except Exception as e:
                 log.warning(f"progress edit failed: {e!r}")
@@ -937,6 +995,20 @@ async def progress_loop(msg):
             break
         await asyncio.sleep(PROGRESS_EVERY)
     await say("🏁 Run finished.", inline_main())
+
+
+progress_msg_id: Optional[int] = None
+
+
+async def refresh_progress_view():
+    global progress_msg_id
+    if progress_msg_id is None:
+        return
+    text, page, total_pages = render_page(PAGE["n"])
+    try:
+        await edit_msg(progress_msg_id, text, inline_run(page, total_pages) if is_running() else inline_main())
+    except Exception as e:
+        log.warning(f"page nav edit failed: {e!r}")
 
 
 # ---------- PING ----------
@@ -961,28 +1033,54 @@ async def ping_one(a: Acc):
         return False, f"❌ {a.tag()} — no response ({type(e).__name__})"
 
 
+PING_PAGE = {"n": 0, "pages": []}
+
+
 async def act_ping():
     prim = primaries()
     if not prim:
-        return await say("No working accounts.\n\n" + accounts_report(), inline_main())
+        return await say("No working accounts.\n\n" + "\n\n".join(accounts_report_pages()), inline_main())
     results = await asyncio.gather(*(ping_one(a) for a in prim))
     alive = sum(1 for ok, _ in results if ok)
     spare = sum(1 for a in accs if a.role == "spare")
-    lines = [f"🏓 Ping: {alive}/{len(prim)} accounts alive ({len(accs)} strings, {spare} spare)\n"]
-    lines += [t for _, t in results]
+    all_lines = [t for _, t in results]
     bad = [a for a in accs if a.role == "broken"]
     if bad:
-        lines.append("\n⚠️ Corrupt/broken strings:")
-        lines += [describe_broken(a) for a in bad]
-    lines.append(f"\n🕒 {datetime.now(IST).strftime('%H:%M:%S')} IST")
-    await say("\n".join(lines), inline_main())
+        all_lines.append("⚠️ Corrupt/broken strings:")
+        all_lines += [describe_broken(a) for a in bad]
+
+    header = f"🏓 Ping: {alive}/{len(prim)} accounts alive ({len(accs)} strings, {spare} spare)"
+    pages, cur, cur_len = [], [header], len(header)
+    for ln in all_lines:
+        if cur_len + len(ln) + 1 > 3200:
+            pages.append("\n".join(cur))
+            cur, cur_len = [header], len(header)
+        cur.append(ln)
+        cur_len += len(ln) + 1
+    pages.append("\n".join(cur))
+
+    PING_PAGE["pages"] = pages
+    PING_PAGE["n"] = 0
+    text = pages[0] + f"\n\nPage 1/{len(pages)}\n🕒 {datetime.now(IST).strftime('%H:%M:%S')} IST"
+    await say(text, inline_pages(0, len(pages), base="ping"))
+
+
+ACC_PAGE = {"n": 0, "pages": []}
+
+
+async def act_accounts():
+    pages = accounts_report_pages()
+    ACC_PAGE["pages"] = pages
+    ACC_PAGE["n"] = 0
+    text = pages[0] + (f"\n\nPage 1/{len(pages)}" if len(pages) > 1 else "")
+    await say(text, inline_pages(0, len(pages), base="acc"))
 
 
 # ---------- ACTIONS ----------
 async def act_run():
-    global progress_task
+    global progress_task, progress_msg_id, _last_issue_count
     if is_running():
-        return await say("Already running.", inline_run())
+        return await say("Already running.", inline_run(PAGE["n"], 1))
     ensure_today()
     started, skipped = 0, []
     for a in primaries():
@@ -1001,9 +1099,13 @@ async def act_run():
         started += 1
     if not started:
         return await say("✅ All accounts already completed today's limit.\n" + "\n".join(skipped), inline_main())
-    note = ("\n\n⏭ Already done today:\n" + "\n".join(skipped)) if skipped else ""
-    msg = await say(render() + note, inline_run())
-    progress_task = asyncio.create_task(progress_loop(msg))
+    PAGE["n"] = 0
+    _last_issue_count = issues_count()
+    text, page, total_pages = render_page(0)
+    if skipped:
+        text += "\n\n⏭ Already done today:\n" + "\n".join(skipped)
+    progress_msg_id = await say(text, inline_run(page, total_pages))
+    progress_task = asyncio.create_task(progress_loop(progress_msg_id))
 
 
 async def act_stop():
@@ -1016,7 +1118,9 @@ async def act_stop():
 
 
 async def act_status():
-    await say(render(), inline_run() if is_running() else inline_main())
+    global progress_msg_id
+    text, page, total_pages = render_page(PAGE["n"])
+    progress_msg_id = await say(text, inline_run(page, total_pages) if is_running() else inline_main())
 
 
 async def act_set(arg=None):
@@ -1112,6 +1216,7 @@ HELP = ("Commands:\n/run /stop /status /ping\n/dashboard - earnings today and li
         "/set 50 - replies per account\n/set off - random target\n"
         "/autorun - toggle scheduled daily run\n/schedule 2:00 am - set the daily run time\n"
         "/broadcast <msg> - send one message to all accounts right now\n"
+        "/issues - accounts with errors/cooldowns right now\n"
         "/reset - reset today's counts to 0/50\n/menu - show keyboard\n/hide - hide keyboard")
 
 
@@ -1130,7 +1235,7 @@ async def dispatch(cmd, arg=None):
     if cmd == "ping":
         return await act_ping()
     if cmd == "accounts":
-        return await say(accounts_report(), inline_main())
+        return await act_accounts()
     if cmd == "dashboard":
         return await say(dashboard(), inline_main())
     if cmd == "balance":
@@ -1143,6 +1248,8 @@ async def dispatch(cmd, arg=None):
         return await act_schedule(arg)
     if cmd == "broadcast":
         return await act_broadcast(arg)
+    if cmd == "issues":
+        return await say(render_issues(), inline_main())
     if cmd == "reset":
         return await act_reset_today()
 
@@ -1171,8 +1278,49 @@ async def h_msg(ev):
 
 @bot.on(events.CallbackQuery(func=lambda e: e.sender_id == ADMIN_ID))
 async def h_cb(ev):
+    global progress_msg_id
     d = ev.data.decode()
     await ev.answer()
+
+    if d == "noop":
+        return
+
+    if d.startswith("page:"):
+        if d == "page:next":
+            PAGE["n"] += 1
+        elif d == "page:prev":
+            PAGE["n"] -= 1
+        progress_msg_id = ev.message_id
+        return await refresh_progress_view()
+
+    if d.startswith("accpage:"):
+        pages = ACC_PAGE.get("pages") or accounts_report_pages()
+        n = ACC_PAGE.get("n", 0)
+        n = n + 1 if d == "accpage:next" else n - 1
+        n = max(0, min(n, len(pages) - 1))
+        ACC_PAGE["n"] = n
+        text = pages[n] + (f"\n\nPage {n + 1}/{len(pages)}" if len(pages) > 1 else "")
+        try:
+            await edit_msg(ev.message_id, text, inline_pages(n, len(pages), base="acc"))
+        except Exception as e:
+            log.warning(f"acc page edit failed: {e!r}")
+        return
+
+    if d.startswith("pingpage:"):
+        pages = PING_PAGE.get("pages") or [""]
+        n = PING_PAGE.get("n", 0)
+        n = n + 1 if d == "pingpage:next" else n - 1
+        n = max(0, min(n, len(pages) - 1))
+        PING_PAGE["n"] = n
+        text = pages[n] + f"\n\nPage {n + 1}/{len(pages)}\n🕒 {datetime.now(IST).strftime('%H:%M:%S')} IST"
+        try:
+            await edit_msg(ev.message_id, text, inline_pages(n, len(pages), base="ping"))
+        except Exception as e:
+            log.warning(f"ping page edit failed: {e!r}")
+        return
+
+    if d == "issues":
+        return await say(render_issues(), inline_main())
     if d.startswith("set:"):
         return await act_set(d[4:])
     if d == "settarget":
@@ -1256,8 +1404,13 @@ async def main():
     for a in accs:
         if a.role == "broken":
             log.error(describe_broken(a))
-    text = (f"✅ Online. {len(GROUPS)} unique account(s) ready from {len(accs)} string(s).\n\n"
-            f"{accounts_report()}\n\nTap Run, or send /set 50 then /run.")
+    ready_n = len(GROUPS)
+    text = f"✅ Online. {ready_n} unique account(s) ready from {len(accs)} string(s)."
+    pages = accounts_report_pages()
+    text += "\n\n" + pages[0]
+    if len(pages) > 1:
+        text += f"\n\n(+{len(pages) - 1} more page(s) — tap 👥 Accounts to browse)"
+    text += "\n\nTap Run, or send /set 50 then /run."
     await say(text, reply_kb())
     await say("Controls:", inline_main())
     await bot.run_until_disconnected()
